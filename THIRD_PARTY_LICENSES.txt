@@ -1,4 +1,4 @@
-RMathTex 0.1.0 - Third-Party Licenses
+RMathTex 1.0.0 - Third-Party Licenses
 =====================================
 
 RMathTex is a Windows-only desktop formula editor written in Rust.
