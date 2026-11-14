@@ -7,23 +7,24 @@ use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, RichText, Sense};
 
 use crate::catalog;
 use crate::clipboard;
-use crate::config;
+use crate::config::{self, WindowGeometry};
 use crate::convert;
 use crate::export;
 use crate::linearmath;
 use crate::model::{
     self, to_markdown, AppError, CoverageLevel, Delimiter, ExportStyle, ExportTarget, Level,
     NormalizedSource, Notice, PngBackgroundChoice, RenderKey, Rendered, ThemeChoice,
-    AUTO_FLAVOR_FALLBACK, DEBOUNCE_MS, DEFAULT_BACKGROUND, DEFAULT_DPI, DEFAULT_FONT_SIZE_PT,
-    DPI_CHOICES, EDITOR_ROWS, FONT_SIZE_RANGE, HINT_COPY_MARKDOWN, HINT_COPY_OFFICE, MSG_CANCELLED,
-    MSG_CONFIG_SAVED, MSG_COPY_OK, MSG_DOCX_OMML_FAILED, MSG_EMPTY_SOURCE, MSG_EXPORT_OK,
-    MSG_EXTENDED, MSG_IMPORT_OK, MSG_MATHML_UNAVAILABLE, MSG_MD_COPY_OK, MSG_MD_EXPORT_OK,
-    MSG_OMML_UNAVAILABLE, MSG_PLAIN_ONLY, MSG_READY, MSG_UI_FONT_MISSING, MSG_UNSUPPORTED,
-    SOURCE_PANEL_FRACTION, TEXT_EDIT_MARGIN_Y,
+    AUTO_FLAVOR_FALLBACK, CONFIG_VERSION, DEBOUNCE_MS, DEFAULT_BACKGROUND, DEFAULT_DPI,
+    DEFAULT_FONT_SIZE_PT, DPI_CHOICES, EDITOR_ROWS, FONT_SIZE_RANGE, HINT_COPY_MARKDOWN,
+    HINT_COPY_OFFICE, MSG_CANCELLED, MSG_CONFIG_SAVED, MSG_COPY_OK, MSG_DOCX_OMML_FAILED,
+    MSG_EMPTY_SOURCE, MSG_EXPORT_OK, MSG_EXTENDED, MSG_IMPORT_OK, MSG_MATHML_UNAVAILABLE,
+    MSG_MD_COPY_OK, MSG_MD_EXPORT_OK, MSG_OMML_UNAVAILABLE, MSG_PLAIN_ONLY, MSG_READY,
+    MSG_UI_FONT_MISSING, MSG_UNSUPPORTED, SOURCE_PANEL_FRACTION, TEXT_EDIT_MARGIN_Y,
 };
 use crate::render::Renderer;
 
-/// All in-memory state of the editor; only the favorites list is persisted.
+/// All in-memory state of the editor; only the favorites list and the window
+/// rectangle are persisted.
 pub struct RMathTexApp {
     source: String,
     normalized: NormalizedSource,
@@ -37,19 +38,27 @@ pub struct RMathTexApp {
     png_background: PngBackgroundChoice,
     markdown_flavor: Option<Delimiter>,
     favorites: Vec<String>,
+    window: Option<WindowGeometry>,
+    /// Whether the startup file was readable; a corrupt file must not be
+    /// overwritten by the implicit shutdown save.
+    config_loaded: bool,
     show_favorites_manager: bool,
     notice: Notice,
 }
 
 impl RMathTexApp {
     /// Builds the app; the embedded math font is the only fallible startup step.
-    pub fn new(creation: &eframe::CreationContext<'_>) -> Result<Self, AppError> {
+    pub fn new(
+        creation: &eframe::CreationContext<'_>,
+        startup: Result<config::Config, AppError>,
+    ) -> Result<Self, AppError> {
         let renderer = Renderer::new()?;
-        let (favorites, config_error) = match config::load() {
-            Ok(config) => (config.favorites, None),
-            Err(error) => (catalog::default_favorites(), Some(error)),
+        let (favorites, window, config_error) = match startup {
+            Ok(config) => (config.favorites, config.window, None),
+            Err(error) => (catalog::default_favorites(), None, Some(error)),
         };
         let font_ready = install_ui_font(&creation.egui_ctx);
+        let config_loaded = config_error.is_none();
         let notice = match (config_error, font_ready) {
             (Some(error), false) => Notice::warn(
                 error.code,
@@ -72,6 +81,8 @@ impl RMathTexApp {
             png_background: DEFAULT_BACKGROUND,
             markdown_flavor: None,
             favorites,
+            window,
+            config_loaded,
             show_favorites_manager: false,
             notice,
         })
@@ -600,12 +611,59 @@ impl RMathTexApp {
     }
 
     fn persist_favorites(&mut self) {
-        match config::save(&self.favorites) {
+        match config::save(&self.config_snapshot()) {
             Ok(path) => {
+                self.config_loaded = true;
                 let path = path.display().to_string();
                 self.notice = Notice::info(fill(MSG_CONFIG_SAVED, &[("path", &path)]));
             }
             Err(error) => self.fail(error),
+        }
+    }
+
+    /// Snapshot of everything the configuration file owns.
+    fn config_snapshot(&self) -> config::Config {
+        config::Config {
+            version: CONFIG_VERSION,
+            favorites: self.favorites.clone(),
+            window: self.window,
+        }
+    }
+
+    /// Mirrors the current viewport rectangle into the persisted geometry.
+    fn capture_window(&mut self, ctx: &egui::Context) {
+        let (inner, outer, maximized, minimized) = ctx.input(|input| {
+            let info = input.viewport();
+            (
+                info.inner_rect,
+                info.outer_rect,
+                info.maximized,
+                info.minimized,
+            )
+        });
+        // A minimized window reports a degenerate rectangle; keep the last one.
+        if minimized == Some(true) {
+            return;
+        }
+        let (Some(inner), Some(outer)) = (inner, outer) else {
+            return;
+        };
+        self.window = Some(WindowGeometry {
+            position: [outer.min.x, outer.min.y],
+            size: [inner.width(), inner.height()],
+            maximized: maximized.unwrap_or(false),
+        });
+    }
+
+    /// Writes the final snapshot during shutdown, when no status notice can show.
+    fn persist_on_exit(&mut self) {
+        if !self.config_loaded {
+            return;
+        }
+        if let Err(error) = config::save(&self.config_snapshot()) {
+            // The window is already closing, so the log is the only remaining
+            // sink; dropping the error would silently lose the saved settings.
+            eprintln!("{}: {}", error.code, error.message);
         }
     }
 
@@ -751,6 +809,7 @@ impl RMathTexApp {
 
 impl eframe::App for RMathTexApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.capture_window(ctx);
         self.handle_shortcuts(ctx);
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             self.menu_bar(ctx, ui);
@@ -769,6 +828,10 @@ impl eframe::App for RMathTexApp {
             .show(ctx, |ui| self.editor(ui));
         egui::CentralPanel::default().show(ctx, |ui| self.preview(ctx, ui));
         self.favorites_manager(ctx);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.persist_on_exit();
     }
 }
 

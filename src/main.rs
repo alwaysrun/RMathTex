@@ -61,16 +61,30 @@ fn read_u32(bytes: &[u8]) -> Option<usize> {
 }
 
 fn main() -> eframe::Result {
+    // Loading once keeps the restored geometry and the in-app notice consistent.
+    let startup = config::load();
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size(model::WINDOW_SIZE)
-            .with_min_inner_size(model::MIN_WINDOW_SIZE)
-            .with_icon(window_icon()),
+        viewport: viewport_builder(startup.as_ref().ok()),
         ..Default::default()
     };
     eframe::run_native(
         "RMathTex",
         options,
-        Box::new(|creation| Ok(Box::new(app::RMathTexApp::new(creation)?))),
+        Box::new(move |creation| Ok(Box::new(app::RMathTexApp::new(creation, startup)?))),
     )
+}
+
+/// Applies the persisted window rectangle when the configuration was readable.
+fn viewport_builder(config: Option<&config::Config>) -> egui::ViewportBuilder {
+    let mut builder = egui::ViewportBuilder::default()
+        .with_inner_size(model::WINDOW_SIZE)
+        .with_min_inner_size(model::MIN_WINDOW_SIZE)
+        .with_icon(window_icon());
+    if let Some(window) = config.and_then(|config| config.window) {
+        builder = builder
+            .with_inner_size(window.size)
+            .with_position(window.position)
+            .with_maximized(window.maximized);
+    }
+    builder
 }
