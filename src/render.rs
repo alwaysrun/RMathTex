@@ -5,18 +5,24 @@
 //! app can paint them with a system font; a Chinese preview therefore neither
 //! fails nor drops characters.
 
+use std::cmp::Ordering;
+
 use eframe::egui;
 use latex_rust::{
-    latex_to_shapes, layout_with_em_size_pt, parse, shapes as emit_shapes, BoxContent, Color, Dim,
+    layout_with_em_size_pt, parse, shapes as emit_shapes, ttf_parser, BoxContent, Color, Dim,
     EguiOptions, MathBox, MathFont, MathStyle,
 };
 
-use crate::model::{AppError, PreviewLabel, RenderKey, Rendered};
+use crate::model::{source_rows, AppError, ExportStyle, PreviewLabel, RenderKey, Rendered};
 
 /// Gap between stacked preview lines, in units of the preview font size.
 const LINE_GAP_EM: f32 = 0.35;
 /// Minimum top-to-top advance of a stacked preview line, in units of the font size.
 const LINE_ADVANCE_EM: f32 = 1.2;
+/// [`LINE_GAP_EM`] as an exact ratio for the export layout engine.
+const EXPORT_LINE_GAP: (i64, i64) = (7, 20);
+/// [`LINE_ADVANCE_EM`] as an exact ratio for the export layout engine.
+const EXPORT_LINE_ADVANCE: (i64, i64) = (6, 5);
 
 /// Placeholder characters tried in order when the math face lacks a glyph.
 ///
@@ -30,6 +36,12 @@ const PLACEHOLDER_CANDIDATES: [char; 3] = ['\u{25A1}', '\u{25A0}', '\u{25FB}'];
 /// CJK faces place the ideographic em square roughly between `-0.12 em` and
 /// `0.88 em`; centring the fallback ink there aligns it with the math baseline.
 const CJK_INK_CENTER_EM: f32 = 0.38;
+
+/// Upright bar glyphs: `vmatrix` delimiters and `\left|…\right|`.
+///
+/// STIX Two Math carries no vertical MATH variants for either, so the layout
+/// engine can only draw the base glyph and every bar stays about one em tall.
+const BAR_GLYPHS: [char; 2] = ['|', '‖'];
 
 /// Owns the single embedded STIX Two Math face.
 pub struct Renderer {
@@ -48,6 +60,62 @@ impl Renderer {
     #[must_use]
     pub fn font(&self) -> &MathFont {
         &self.font
+    }
+
+    /// Lays out `src` for the file exporters with the preview's corrections.
+    ///
+    /// The exporters serialize a laid-out tree; sharing [`Self::layout_row`]
+    /// keeps their delimiters consistent with the preview. Hard newlines
+    /// outside braces and environments stack rows with the preview's spacing,
+    /// and blank rows become the same empty advance the preview paints.
+    pub fn layout_export(&self, src: &str, style: &ExportStyle) -> Result<MathBox, AppError> {
+        let em = Dim::from_i64(style.font_size_pt);
+        let rows = source_rows(src);
+        let visible = rows.iter().filter(|row| !row.is_empty()).count();
+        if visible <= 1 {
+            return self
+                .layout_row(src, &em, style.display)
+                .map_err(|error| AppError::caused("E601", "公式渲染失败", error));
+        }
+        self.layout_rows(&rows, &em, style.display)
+            .map_err(|error| AppError::caused("E601", "公式渲染失败", error))
+    }
+
+    /// Stacks one row per source line, inserting the preview's vertical gaps.
+    fn layout_rows(
+        &self,
+        rows: &[&str],
+        em: &Dim,
+        display: bool,
+    ) -> Result<MathBox, latex_rust::Error> {
+        let mut children = Vec::new();
+        let mut previous: Option<Dim> = None;
+        for row in rows {
+            if let Some(span) = previous.take() {
+                children.push(row_spacer(&span));
+            }
+            if row.is_empty() {
+                previous = Some(Dim::zero());
+            } else {
+                let row_box = self.layout_row(row, em, display)?;
+                previous = Some(&row_box.height + &row_box.depth);
+                children.push(row_box);
+            }
+        }
+        Ok(MathBox::vpack(children))
+    }
+
+    /// Parses, lays out and corrects one row of math.
+    fn layout_row(&self, src: &str, em: &Dim, display: bool) -> Result<MathBox, latex_rust::Error> {
+        let ast = parse(src)?;
+        let style = if display {
+            MathStyle::Display
+        } else {
+            MathStyle::Text
+        };
+        let mut tree = layout_with_em_size_pt(&ast, &self.font, style, em)?;
+        stretch_bar_delimiters(&mut tree, &self.font);
+        Ok(tree)
     }
 
     /// Parses, lays out and tessellates `src` at `origin`.
@@ -70,10 +138,11 @@ impl Renderer {
         options.color = Color::rgb(key.color[0], key.color[1], key.color[2]);
         options.display = key.display;
         let pixels_per_point = f32::from_bits(key.ppp_bits);
-        let lines = preview_lines(src);
-        if lines.len() > 1 {
+        let rows = source_rows(src);
+        let visible = rows.iter().filter(|row| !row.is_empty()).count();
+        if visible > 1 {
             if let Ok(rendered) =
-                self.render_stacked(&lines, &options, key, origin, pixels_per_point)
+                self.render_stacked(&rows, &options, key, origin, pixels_per_point)
             {
                 return Ok(rendered);
             }
@@ -82,9 +151,12 @@ impl Renderer {
     }
 
     /// Renders one row per line and stacks them from `origin` downwards.
+    ///
+    /// Blank rows emit no shapes but still advance the cursor, so a blank line
+    /// in the source becomes visible vertical spacing.
     fn render_stacked(
         &self,
-        lines: &[&str],
+        rows: &[&str],
         options: &EguiOptions,
         key: RenderKey,
         origin: egui::Pos2,
@@ -97,10 +169,15 @@ impl Renderer {
         let mut labels = Vec::new();
         let mut bounds = egui::Rect::NOTHING;
         let mut top = origin.y;
-        for line in lines {
+        for row in rows {
+            if row.is_empty() {
+                // An empty row has no ink, so the minimum advance is its full height.
+                top += min_advance;
+                continue;
+            }
             let line_origin = egui::pos2(origin.x, top);
             let mut rendered =
-                self.render_line(line, options, key, line_origin, pixels_per_point)?;
+                self.render_line(row, options, key, line_origin, pixels_per_point)?;
             shapes.append(&mut rendered.shapes);
             labels.append(&mut rendered.labels);
             bounds = bounds.union(rendered.rect);
@@ -128,8 +205,11 @@ impl Renderer {
                 self.render_with_fallback(&prepared, options, key, origin, pixels_per_point)
             }
             None => {
+                let tree = self
+                    .layout_row(src, &options.font_size_pt, options.display)
+                    .map_err(map_error)?;
                 let (shapes, rect) =
-                    latex_to_shapes(src, &self.font, options, origin, pixels_per_point)
+                    emit_shapes(&tree, &self.font, options, origin, pixels_per_point)
                         .map_err(map_error)?;
                 Ok(Rendered {
                     key,
@@ -151,13 +231,8 @@ impl Renderer {
         origin: egui::Pos2,
         pixels_per_point: f32,
     ) -> Result<Rendered, AppError> {
-        let ast = parse(&prepared.latex).map_err(|error| map_error(error.into()))?;
-        let style = if options.display {
-            MathStyle::Display
-        } else {
-            MathStyle::Text
-        };
-        let mut tree = layout_with_em_size_pt(&ast, &self.font, style, &options.font_size_pt)
+        let mut tree = self
+            .layout_row(&prepared.latex, &options.font_size_pt, options.display)
             .map_err(map_error)?;
         let em_px = dim_to_f32(&options.font_size_pt) * pixels_per_point;
         let root_baseline = origin.y + dim_to_f32(&tree.height) * em_px;
@@ -178,6 +253,107 @@ impl Renderer {
             rect,
         })
     }
+}
+
+/// Stretches bar delimiters to the height of the body they enclose.
+///
+/// The layout engine can only pick vertical MATH variants, and the embedded
+/// face has none for [`BAR_GLYPHS`]: a `vmatrix` bar therefore stays near one em
+/// while parentheses reach the matrix height. Replacing the glyph with a line
+/// sized to the body keeps the preview, SVG and PNG output identical.
+fn stretch_bar_delimiters(bx: &mut MathBox, font: &MathFont) {
+    match &mut bx.content {
+        BoxContent::HList(children) => {
+            for child in children.iter_mut() {
+                stretch_bar_delimiters(child, font);
+            }
+            stretch_bar_pair(children, font);
+        }
+        BoxContent::VList(children) | BoxContent::Overlap(children) => {
+            for child in children.iter_mut() {
+                stretch_bar_delimiters(child, font);
+            }
+        }
+        BoxContent::Color(_, inner) | BoxContent::BackColor(_, inner) => {
+            stretch_bar_delimiters(inner, font);
+        }
+        BoxContent::Frame { inner, .. } => stretch_bar_delimiters(inner, font),
+        BoxContent::Empty
+        | BoxContent::Kern(_)
+        | BoxContent::Rule
+        | BoxContent::Line { .. }
+        | BoxContent::Glyph { .. } => {}
+    }
+}
+
+/// Rewrites the enclosing bars of `[left, body, right]` when the body is taller.
+///
+/// Delimited bodies (matrix stacks and `\left…\right`) lay out as exactly three
+/// siblings, so any other row shape is left untouched.
+fn stretch_bar_pair(children: &mut [MathBox], font: &MathFont) {
+    let [left, body, right] = children else {
+        return;
+    };
+    let Some(bar) = bar_glyph(left) else {
+        return;
+    };
+    if bar_glyph(right) != Some(bar) {
+        return;
+    }
+    let height = (&body.height + &body.shift).clamp_nonneg();
+    let depth = (&body.depth - &body.shift).clamp_nonneg();
+    let body_span = &height + &depth;
+    let bar_span = &left.height + &left.depth;
+    if !matches!(body_span.cmp(&bar_span), Some(Ordering::Greater)) {
+        return;
+    }
+    let Some(stretched) = stretched_bar(font, bar, &height, &depth) else {
+        return;
+    };
+    *left = stretched.clone();
+    *right = stretched;
+}
+
+/// The bar character when this box is a single unstretchable delimiter glyph.
+fn bar_glyph(bx: &MathBox) -> Option<char> {
+    match &bx.content {
+        BoxContent::Glyph { ch, .. } if BAR_GLYPHS.contains(ch) => Some(*ch),
+        _ => None,
+    }
+}
+
+/// A stroked segment spanning `height`/`depth` that keeps the glyph's advance.
+///
+/// A filled rule would be equally accurate, but tiny-skia draws sub-pixel-wide
+/// rectangles through its hairline path, which asserts on degenerate widths in
+/// debug builds; a stroked segment has no such edge case.
+fn stretched_bar(font: &MathFont, ch: char, height: &Dim, depth: &Dim) -> Option<MathBox> {
+    let metrics = font.glyph(ch).ok()?;
+    let units_per_em = font.units_per_em();
+    let bbox = font
+        .face()
+        .glyph_bounding_box(ttf_parser::GlyphId(metrics.glyph_id))?;
+    let ink_width =
+        Dim::from_font_units(i64::from(bbox.x_max) - i64::from(bbox.x_min), units_per_em);
+    if ink_width.is_zero() {
+        return None;
+    }
+    let left_bearing = Dim::from_font_units(i64::from(bbox.x_min), units_per_em).clamp_nonneg();
+    let center = &left_bearing + &(&ink_width / &Dim::from_i64(2));
+    Some(MathBox {
+        width: metrics.advance,
+        height: height.clone(),
+        depth: depth.clone(),
+        italic: Dim::zero(),
+        shift: Dim::zero(),
+        content: BoxContent::Line {
+            x1: center.clone(),
+            y1: height.clone(),
+            x2: center,
+            y2: &Dim::zero() - depth,
+            thickness: ink_width,
+        },
+    })
 }
 
 /// A line rewritten for the fallback path.
@@ -359,57 +535,16 @@ fn dim_to_f32(value: &Dim) -> f32 {
     f32::from_bits(value.to_ieee32_bits())
 }
 
-/// Splits a body at hard newlines: depth-0 braces and environments keep theirs.
+/// Vertical space that turns a row's ink extent into the preview's line advance.
 ///
-/// Trimmed results are returned; blank lines are dropped so trailing newlines
-/// and blank separators do not allocate empty rows.
-fn preview_lines(src: &str) -> Vec<&str> {
-    let bytes = src.as_bytes();
-    let mut lines = Vec::new();
-    let mut start = 0usize;
-    let mut braces = 0usize;
-    let mut environments = 0usize;
-    let mut index = 0usize;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'\\' => {
-                let name_start = index + 1;
-                let mut name_end = name_start;
-                while name_end < bytes.len() && bytes[name_end].is_ascii_alphabetic() {
-                    name_end += 1;
-                }
-                if name_end == name_start {
-                    // Escaped character such as `\\` or `\{`; both bytes are literal.
-                    index = name_start + 1;
-                } else {
-                    match &src[name_start..name_end] {
-                        "begin" => environments += 1,
-                        "end" => environments = environments.saturating_sub(1),
-                        _ => {}
-                    }
-                    index = name_end;
-                }
-                continue;
-            }
-            b'{' => braces += 1,
-            b'}' => braces = braces.saturating_sub(1),
-            b'\n' if braces == 0 && environments == 0 => {
-                push_preview_line(&mut lines, &src[start..index]);
-                start = index + 1;
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-    push_preview_line(&mut lines, &src[start..]);
-    lines
-}
-
-fn push_preview_line<'a>(lines: &mut Vec<&'a str>, line: &'a str) {
-    let trimmed = line.trim();
-    if !trimmed.is_empty() {
-        lines.push(trimmed);
-    }
+/// The rule has no width, so SVG and PNG renderers skip it visually while
+/// [`MathBox::vpack`] still accounts for its height between rows.
+fn row_spacer(span: &Dim) -> MathBox {
+    let advance = Dim::ratio(EXPORT_LINE_ADVANCE.0, EXPORT_LINE_ADVANCE.1);
+    let gap = Dim::ratio(EXPORT_LINE_GAP.0, EXPORT_LINE_GAP.1);
+    // Mirrors the preview's `(height + gap).max(min_advance)` advance.
+    let height = &(span + &gap).max(&advance) - span;
+    MathBox::rule(Dim::zero(), height, Dim::zero())
 }
 
 fn map_error(error: latex_rust::Error) -> AppError {
@@ -429,9 +564,10 @@ fn map_error(error: latex_rust::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use eframe::egui;
+    use latex_rust::{BoxContent, Dim, MathBox};
 
-    use super::{preview_lines, Renderer};
-    use crate::model::RenderKey;
+    use super::{Renderer, BAR_GLYPHS};
+    use crate::model::{source_rows, ExportStyle, RenderKey};
 
     fn preview(src: &str) -> crate::model::Rendered {
         let renderer = Renderer::new().expect("embedded font");
@@ -441,12 +577,73 @@ mod tests {
             .expect("preview renders")
     }
 
+    fn bar_spans(bx: &MathBox, spans: &mut Vec<Dim>) {
+        match &bx.content {
+            BoxContent::Line { y1, y2, .. } => spans.push(y1 - y2),
+            BoxContent::HList(children)
+            | BoxContent::VList(children)
+            | BoxContent::Overlap(children) => {
+                for child in children {
+                    bar_spans(child, spans);
+                }
+            }
+            BoxContent::Color(_, inner) | BoxContent::BackColor(_, inner) => {
+                bar_spans(inner, spans);
+            }
+            BoxContent::Frame { inner, .. } => bar_spans(inner, spans),
+            _ => {}
+        }
+    }
+
+    fn bar_glyph_count(bx: &MathBox) -> usize {
+        match &bx.content {
+            BoxContent::Glyph { ch, .. } if BAR_GLYPHS.contains(ch) => 1,
+            BoxContent::HList(children)
+            | BoxContent::VList(children)
+            | BoxContent::Overlap(children) => children.iter().map(bar_glyph_count).sum(),
+            BoxContent::Color(_, inner) | BoxContent::BackColor(_, inner) => bar_glyph_count(inner),
+            BoxContent::Frame { inner, .. } => bar_glyph_count(inner),
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn vmatrix_bars_span_the_matrix_height() {
+        let renderer = Renderer::new().expect("embedded font");
+        let tree = renderer
+            .layout_export(
+                r"\begin{vmatrix} a & b \\ c & d \end{vmatrix}",
+                &ExportStyle::default(),
+            )
+            .expect("matrix lays out");
+        let mut spans = Vec::new();
+        bar_spans(&tree, &mut spans);
+        let tallest = spans
+            .into_iter()
+            .max_by(|left, right| left.cmp(right).expect("finite dimensions"))
+            .expect("bars become segments");
+        assert!(
+            tallest.eq_dim(&(&tree.height + &tree.depth)),
+            "a vmatrix bar must reach the matrix height"
+        );
+        assert_eq!(bar_glyph_count(&tree), 0, "bars are drawn as segments");
+    }
+
+    #[test]
+    fn leaves_unpaired_bars_as_glyphs() {
+        let renderer = Renderer::new().expect("embedded font");
+        let tree = renderer
+            .layout_export("a | b", &ExportStyle::default())
+            .expect("row lays out");
+        assert_eq!(bar_glyph_count(&tree), 1, "a lone bar is not a delimiter");
+    }
+
     #[test]
     fn splits_hard_newlines_only_at_depth_zero() {
         let source =
             "a + b\n\\frac{x\n}{y}\n\\begin{pmatrix}\n1 & 2 \\\\\n3 & 4\n\\end{pmatrix}\nc";
         assert_eq!(
-            preview_lines(source),
+            source_rows(source),
             vec![
                 "a + b",
                 "\\frac{x\n}{y}",
@@ -457,8 +654,30 @@ mod tests {
     }
 
     #[test]
-    fn drops_blank_and_trailing_lines() {
-        assert_eq!(preview_lines("x\n\n  y  \n"), vec!["x", "y"]);
+    fn blank_lines_advance_the_preview() {
+        let compact = preview("x\ny");
+        let spaced = preview("x\n\ny");
+        assert!(
+            spaced.rect.height() > compact.rect.height(),
+            "a blank line must add vertical space"
+        );
+    }
+
+    #[test]
+    fn blank_lines_add_export_space() {
+        let renderer = Renderer::new().expect("embedded font");
+        let style = ExportStyle::default();
+        let compact = renderer.layout_export("x\ny", &style).expect("stacked");
+        let spaced = renderer.layout_export("x\n\ny", &style).expect("spaced");
+        let compact_span = &compact.height + &compact.depth;
+        let spaced_span = &spaced.height + &spaced.depth;
+        assert!(
+            matches!(
+                spaced_span.cmp(&compact_span),
+                Some(std::cmp::Ordering::Greater)
+            ),
+            "a blank line must add export space"
+        );
     }
 
     #[test]

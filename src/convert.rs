@@ -319,10 +319,69 @@ pub fn to_omml(latex: &str) -> Result<String, AppError> {
         .map_err(|error| AppError::caused("E303", "OMML 转换失败", error))
 }
 
+/// Converts source rows into one MathML table so Office keeps hard line breaks.
+///
+/// Word maps `<mtable>` to a multi-row equation, whereas a flat `<math>` would
+/// fold the newlines into spaces. Blank rows stay as empty cells so the copied
+/// gap survives the import.
+pub fn rows_to_mathml(rows: &[&str], display: bool) -> Result<String, AppError> {
+    let mut table = String::from("<mtable>");
+    for row in rows {
+        table.push_str("<mtr><mtd>");
+        if !row.is_empty() {
+            let mathml = to_mathml(row, display)?;
+            table.push_str(mathml_inner(&mathml));
+        }
+        table.push_str("</mtd></mtr>");
+    }
+    table.push_str("</mtable>");
+    let display = if display { "block" } else { "inline" };
+    Ok(format!(
+        r#"<math xmlns="http://www.w3.org/1998/Math/MathML" display="{display}">{table}</math>"#
+    ))
+}
+
+/// Converts source rows into one `<m:eqArr>`, Word's native multi-line form.
+pub fn rows_to_omml(rows: &[&str]) -> Result<String, AppError> {
+    let mut array = String::from("<m:eqArr>");
+    for row in rows {
+        array.push_str("<m:e>");
+        if !row.is_empty() {
+            array.push_str(omml_inner(&to_omml(row)?));
+        }
+        array.push_str("</m:e>");
+    }
+    array.push_str("</m:eqArr>");
+    Ok(format!("<m:oMath>{array}</m:oMath>"))
+}
+
 /// Converts an `<m:oMath>` element back to LaTeX.
 pub fn from_omml(omml: &str) -> Result<String, AppError> {
     easydoc_math::omml_to_latex::convert(omml)
         .map_err(|error| AppError::caused("E304", "OMML 还原 LaTeX 失败", error))
+}
+
+/// Keeps the inner content of `<m:oMath>` for callers that own the root.
+pub(crate) fn omml_inner(omml: &str) -> &str {
+    let trimmed = omml.trim();
+    if !trimmed.starts_with("<m:oMath") {
+        return trimmed;
+    }
+    let Some(open_end) = trimmed.find('>') else {
+        return trimmed;
+    };
+    let body = &trimmed[open_end + 1..];
+    body.strip_suffix("</m:oMath>").unwrap_or(body)
+}
+
+/// Keeps the inner content of `<math>` so callers can rebuild the root.
+fn mathml_inner(mathml: &str) -> &str {
+    let trimmed = mathml.trim();
+    let Some(open_end) = trimmed.find('>') else {
+        return trimmed;
+    };
+    let body = &trimmed[open_end + 1..];
+    body.strip_suffix("</math>").unwrap_or(body)
 }
 
 /// Scans a normalized body against the three static tables.

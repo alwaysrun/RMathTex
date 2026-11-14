@@ -6,11 +6,12 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use latex_rust::{
-    latex_to_png, latex_to_svg, Color, Dim, MathFont, PngBackground, PngOptions, SvgOptions,
+    render_png, render_svg, Color, Dim, MathBox, MathFont, PngBackground, PngOptions, SvgOptions,
 };
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
+use crate::convert;
 use crate::model::{AppError, ExportStyle, ExportTarget, PngBackgroundChoice, DPI_MAX};
 
 /// `[Content_Types].xml` — one document part, no styles, no macros.
@@ -29,18 +30,21 @@ const ROOT_RELS: &str =
 Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" \
 Target=\"word/document.xml\"/></Relationships>";
 
-/// Renders a self-contained SVG with outline glyphs and a fixed black colour.
-pub fn svg(src: &str, style: &ExportStyle, font: &MathFont) -> Result<String, AppError> {
+/// Renders a laid-out tree as a self-contained SVG with outline glyphs.
+///
+/// The tree is laid out by `render::Renderer::layout_export` so the exported
+/// delimiters match the preview.
+pub fn svg(tree: &MathBox, style: &ExportStyle, font: &MathFont) -> Result<String, AppError> {
     let mut options = SvgOptions::new();
     options.font_size_pt = Dim::from_i64(style.font_size_pt);
     options.color = Color::rgb(style.color[0], style.color[1], style.color[2]);
     options.display = style.display;
-    latex_to_svg(src, font, &options)
+    render_svg(tree, font, &options)
         .map_err(|error| AppError::caused("E601", "SVG 渲染失败", error))
 }
 
-/// Rasterizes a PNG; the resolution must stay inside `(0, DPI_MAX]`.
-pub fn png(src: &str, style: &ExportStyle, font: &MathFont) -> Result<Vec<u8>, AppError> {
+/// Rasterizes a laid-out tree; the resolution must stay inside `(0, DPI_MAX]`.
+pub fn png(tree: &MathBox, style: &ExportStyle, font: &MathFont) -> Result<Vec<u8>, AppError> {
     if !(1..=DPI_MAX).contains(&style.dpi) {
         return Err(AppError::new("E601", "PNG DPI 越界"));
     }
@@ -53,13 +57,16 @@ pub fn png(src: &str, style: &ExportStyle, font: &MathFont) -> Result<Vec<u8>, A
         PngBackgroundChoice::White => PngBackground::White,
     };
     options.display = style.display;
-    latex_to_png(src, font, &options)
+    render_png(tree, font, &options)
         .map_err(|error| AppError::caused("E601", "PNG 渲染失败", error))
 }
 
-/// Packages a minimal OPC document whose only content is an editable formula.
-pub fn docx(omml: &str, display: bool) -> Result<Vec<u8>, AppError> {
-    let document = document_xml(omml, display);
+/// Packages a minimal OPC document whose only content is editable formulas.
+///
+/// Each entry becomes one paragraph; `None` keeps a blank source line as an
+/// empty paragraph so the vertical gap survives the export.
+pub fn docx(rows: &[Option<String>], display: bool) -> Result<Vec<u8>, AppError> {
+    let document = document_xml(rows, display);
     opc_zip(&[
         ("[Content_Types].xml", CONTENT_TYPES.as_bytes()),
         ("_rels/.rels", ROOT_RELS.as_bytes()),
@@ -111,32 +118,30 @@ fn target_file_name(target: ExportTarget) -> &'static str {
 }
 
 /// Builds `word/document.xml`; `display` alone decides the paragraph wrapper.
+///
+/// A `None` row becomes `<w:p/>`: Word renders it as the blank line the source
+/// contained, without inventing formula content.
 #[must_use]
-pub fn document_xml(omml: &str, display: bool) -> String {
-    let inner = omml_inner(omml);
-    let paragraph = if display {
-        format!("<m:oMathPara><m:oMath>{inner}</m:oMath></m:oMathPara>")
-    } else {
-        format!("<m:oMath>{inner}</m:oMath>")
-    };
+pub fn document_xml(rows: &[Option<String>], display: bool) -> String {
+    let mut body = String::new();
+    for row in rows {
+        let Some(omml) = row else {
+            body.push_str("<w:p/>");
+            continue;
+        };
+        let inner = convert::omml_inner(omml);
+        let paragraph = if display {
+            format!("<w:p><m:oMathPara><m:oMath>{inner}</m:oMath></m:oMathPara></w:p>")
+        } else {
+            format!("<w:p><m:oMath>{inner}</m:oMath></w:p>")
+        };
+        body.push_str(&paragraph);
+    }
     format!(
         "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" \
          xmlns:m=\"http://schemas.openxmlformats.org/officeDocument/2006/math\">\
-         <w:body><w:p>{paragraph}</w:p><w:sectPr/></w:body></w:document>"
+         <w:body>{body}<w:sectPr/></w:body></w:document>"
     )
-}
-
-/// Keeps the inner content of `<m:oMath>` so the document root can own `xmlns:m`.
-fn omml_inner(omml: &str) -> &str {
-    let trimmed = omml.trim();
-    if !trimmed.starts_with("<m:oMath") {
-        return trimmed;
-    }
-    let Some(open_end) = trimmed.find('>') else {
-        return trimmed;
-    };
-    let body = &trimmed[open_end + 1..];
-    body.strip_suffix("</m:oMath>").unwrap_or(body)
 }
 
 fn opc_zip(parts: &[(&str, &[u8])]) -> Result<Vec<u8>, AppError> {

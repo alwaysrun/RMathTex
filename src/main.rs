@@ -18,15 +18,53 @@ mod render;
 
 use eframe::egui;
 
-/// Decodes the single 32-bpp BMP entry of the embedded ICO file.
+/// Edge length Windows requests for a title-bar icon at 100 % scaling.
+const WINDOW_ICON_SIZE: usize = 32;
+/// Bytes per pixel of the 32-bpp BGRA bitmaps stored in the ICO file.
+const ICO_PIXEL_BYTES: usize = 4;
+/// Size of the `BITMAPINFOHEADER` that precedes every bitmap in the ICO file.
+const ICO_DIB_HEADER_BYTES: usize = 40;
+/// Bytes of one ICO directory entry.
+const ICO_DIRECTORY_ENTRY_BYTES: usize = 16;
+/// Offset of the ICO directory, which follows the 6-byte file header.
+const ICO_DIRECTORY_OFFSET: usize = 6;
+
+/// Decodes the 32-bpp bitmap entry of the embedded ICO file whose size is
+/// closest to [`WINDOW_ICON_SIZE`], so the title bar and taskbar stay sharp.
 fn window_icon() -> egui::IconData {
-    const ICO: &[u8] = include_bytes!("../assets/icon.ico");
+    const ICO: &[u8] = include_bytes!("../assets/RMathTex.ico");
     let fallback = || egui::IconData {
         rgba: vec![0u8; 4],
         width: 1,
         height: 1,
     };
-    let Some(offset) = ICO.get(18..22).and_then(read_u32) else {
+    let Some(count) = ICO
+        .get(4..6)
+        .map(|raw| usize::from(u16::from_le_bytes([raw[0], raw[1]])))
+    else {
+        return fallback();
+    };
+    let mut best: Option<(usize, usize)> = None;
+    for index in 0..count {
+        let start = ICO_DIRECTORY_OFFSET + index * ICO_DIRECTORY_ENTRY_BYTES;
+        let Some(entry) = ICO.get(start..start + ICO_DIRECTORY_ENTRY_BYTES) else {
+            break;
+        };
+        if u16::from_le_bytes([entry[6], entry[7]]) != 32 {
+            continue;
+        }
+        let Some(offset) = read_u32(&entry[12..16]) else {
+            continue;
+        };
+        let Some(width) = ICO.get(offset + 4..offset + 8).and_then(read_u32) else {
+            continue;
+        };
+        let distance = width.abs_diff(WINDOW_ICON_SIZE);
+        if best.is_none_or(|(_, current)| distance < current) {
+            best = Some((offset, distance));
+        }
+    }
+    let Some((offset, _)) = best else {
         return fallback();
     };
     let Some(header) = ICO.get(offset..offset + 12) else {
@@ -36,15 +74,23 @@ fn window_icon() -> egui::IconData {
         read_u32(&header[4..8]).unwrap_or(0),
         read_u32(&header[8..12]).unwrap_or(0) / 2,
     );
-    let pixels = offset + 40;
-    let Some(bitmap) = ICO.get(pixels..pixels + width * height * 4) else {
+    if width == 0 || height == 0 {
+        return fallback();
+    }
+    let pixels = offset + ICO_DIB_HEADER_BYTES;
+    let byte_len = width * height * ICO_PIXEL_BYTES;
+    let Some(bitmap) = ICO.get(pixels..pixels + byte_len) else {
         return fallback();
     };
-    let mut rgba = vec![0u8; width * height * 4];
+    let mut rgba = vec![0u8; byte_len];
+    let row_bytes = width * ICO_PIXEL_BYTES;
     for row in 0..height {
-        let source = &bitmap[(height - 1 - row) * width * 4..][..width * 4];
-        let target = &mut rgba[row * width * 4..][..width * 4];
-        for (pixel, out) in source.chunks_exact(4).zip(target.chunks_exact_mut(4)) {
+        let source = &bitmap[(height - 1 - row) * row_bytes..][..row_bytes];
+        let target = &mut rgba[row * row_bytes..][..row_bytes];
+        for (pixel, out) in source
+            .chunks_exact(ICO_PIXEL_BYTES)
+            .zip(target.chunks_exact_mut(ICO_PIXEL_BYTES))
+        {
             out.copy_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
         }
     }

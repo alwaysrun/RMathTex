@@ -6,8 +6,8 @@
 .DESCRIPTION
     Compiles the RMathTex binary with Cargo (Release profile by default), then
     copies the executable and the third-party license list into output/.
-    The output directory is recreated on every successful build so it never
-    contains stale artifacts.
+    The output directory is preserved on rebuild, so the configuration file
+    written next to the executable (RMathTex.json) survives a rebuild.
 
 .PARAMETER Configuration
     Cargo build profile: Release (default) or Debug.
@@ -57,10 +57,9 @@ if (-not (Test-Path -LiteralPath $builtBinary -PathType Leaf)) {
     throw "Build artifact not found: $builtBinary"
 }
 
-if (Test-Path -LiteralPath $outputRoot) {
-    Remove-Item -LiteralPath $outputRoot -Recurse -Force
+if (-not (Test-Path -LiteralPath $outputRoot -PathType Container)) {
+    New-Item -ItemType Directory -Path $outputRoot | Out-Null
 }
-New-Item -ItemType Directory -Path $outputRoot | Out-Null
 
 Copy-Item -LiteralPath $builtBinary -Destination (Join-Path $outputRoot $binaryFileName) -Force
 

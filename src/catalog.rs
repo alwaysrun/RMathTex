@@ -683,7 +683,26 @@ pub const FORMULA_CATEGORIES: &[FormulaCategory] = &[
 
 /// Default favorites shown on the toolbar on first launch.
 pub const DEFAULT_FAVORITE_IDS: &[&str] = &[
-    "frac", "sqrt", "sup", "sub", "sum", "int", "lim", "bmatrix", "alpha", "cases",
+    "frac",
+    "sqrt",
+    "sup",
+    "sub",
+    "in",
+    "subset",
+    "cup",
+    "cap",
+    "emptyset",
+    "forall",
+    "sum",
+    "prod",
+    "int",
+    "lim",
+    "derivative",
+    "pmatrix",
+    "bmatrix",
+    "vmatrix",
+    "matrix",
+    "cases",
 ];
 
 /// Category whose entries form the one-click Greek palette on the toolbar.

@@ -1,10 +1,11 @@
 //! Persisted user configuration stored next to the executable.
 //!
-//! The schema is intentionally tiny (`version`, `favorites` and an optional
-//! `window` rectangle), so this module uses a small, strict JSON reader and
-//! writer built on the standard library instead of pulling a serialization
-//! framework into the binary. The file is written atomically on every change so
-//! a crash can never leave a half-written document behind.
+//! The schema is intentionally tiny (`version`, `favorites`, an optional
+//! `window` rectangle and the settings-menu choices), so this module uses a
+//! small, strict JSON reader and writer built on the standard library instead of
+//! pulling a serialization framework into the binary. The file is written
+//! atomically on every change so a crash can never leave a half-written document
+//! behind.
 
 use std::fs;
 use std::io::ErrorKind;
@@ -13,8 +14,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::catalog;
 use crate::model::{
-    AppError, CONFIG_FILE_NAME, CONFIG_VERSION, MIN_WINDOW_SIZE, MSG_CONFIG_LOAD_FAILED,
-    MSG_CONFIG_PATH_FAILED, MSG_CONFIG_SAVE_FAILED,
+    AppError, Delimiter, ExitSavePolicy, PngBackgroundChoice, ThemeChoice, CONFIG_FILE_NAME,
+    CONFIG_VERSION, DEFAULT_BACKGROUND, DEFAULT_DPI, DEFAULT_FONT_SIZE_PT, DPI_CHOICES,
+    FONT_SIZE_RANGE, MIN_WINDOW_SIZE, MSG_CONFIG_LOAD_FAILED, MSG_CONFIG_PATH_FAILED,
+    MSG_CONFIG_SAVE_FAILED,
 };
 
 /// Upper bound (in points) accepted for a restored window size or coordinate.
@@ -46,6 +49,20 @@ pub struct Config {
     pub favorites: Vec<String>,
     /// Window rectangle captured at shutdown; `None` uses the default layout.
     pub window: Option<WindowGeometry>,
+    /// Preview font size in points.
+    pub font_size_pt: i64,
+    /// Explicit Display (true) / Text (false) choice; `None` follows the input.
+    pub display: Option<bool>,
+    /// UI theme preference.
+    pub theme: ThemeChoice,
+    /// PNG export background.
+    pub png_background: PngBackgroundChoice,
+    /// PNG export resolution.
+    pub dpi: i64,
+    /// Markdown output flavor; `None` follows the input delimiters.
+    pub markdown_flavor: Option<Delimiter>,
+    /// Criterion deciding whether closing the window needs confirmation.
+    pub exit_policy: ExitSavePolicy,
 }
 
 impl Default for Config {
@@ -54,6 +71,13 @@ impl Default for Config {
             version: CONFIG_VERSION,
             favorites: catalog::default_favorites(),
             window: None,
+            font_size_pt: DEFAULT_FONT_SIZE_PT,
+            display: None,
+            theme: ThemeChoice::System,
+            png_background: DEFAULT_BACKGROUND,
+            dpi: DEFAULT_DPI,
+            markdown_flavor: None,
+            exit_policy: ExitSavePolicy::default(),
         }
     }
 }
@@ -104,13 +128,20 @@ fn save_to(path: &Path, config: &Config) -> Result<(), AppError> {
         version: CONFIG_VERSION,
         favorites: config.favorites.clone(),
         window: config.window,
+        font_size_pt: config.font_size_pt,
+        display: config.display,
+        theme: config.theme,
+        png_background: config.png_background,
+        dpi: config.dpi,
+        markdown_flavor: config.markdown_flavor,
+        exit_policy: config.exit_policy,
     }
     .sanitized();
     write_atomically(path, to_json(&config).as_bytes())
 }
 
 impl Config {
-    /// Drops unknown identifiers, corrupt geometry and falls back to defaults.
+    /// Drops unknown identifiers, clamps out-of-range choices and falls back to defaults.
     fn sanitized(mut self) -> Self {
         let had_entries = !self.favorites.is_empty();
         self.favorites = catalog::sanitize(&self.favorites);
@@ -119,6 +150,12 @@ impl Config {
         }
         self.version = CONFIG_VERSION;
         self.window = self.window.and_then(WindowGeometry::sanitized);
+        self.font_size_pt = self
+            .font_size_pt
+            .clamp(*FONT_SIZE_RANGE.start(), *FONT_SIZE_RANGE.end());
+        if !DPI_CHOICES.contains(&self.dpi) {
+            self.dpi = DEFAULT_DPI;
+        }
         self
     }
 }
@@ -170,38 +207,138 @@ fn save_error(path: &Path, error: std::io::Error) -> AppError {
 }
 
 fn to_json(config: &Config) -> String {
-    let mut json = String::from("{\n  \"version\": ");
-    json.push_str(&config.version.to_string());
-    json.push_str(",\n  \"favorites\": [");
-    for (index, id) in config.favorites.iter().enumerate() {
-        if index > 0 {
-            json.push_str(", ");
-        }
-        json.push('"');
-        push_escaped(&mut json, id);
-        json.push('"');
-    }
-    json.push(']');
+    let mut members = vec![
+        format!("  \"version\": {}", config.version),
+        format!("  \"favorites\": [{}]", quoted_list(&config.favorites)),
+    ];
     if let Some(window) = config.window {
-        json.push_str(",\n  \"window\": {\"x\": ");
-        push_f32(&mut json, window.position[0]);
-        json.push_str(", \"y\": ");
-        push_f32(&mut json, window.position[1]);
-        json.push_str(", \"width\": ");
-        push_f32(&mut json, window.size[0]);
-        json.push_str(", \"height\": ");
-        push_f32(&mut json, window.size[1]);
-        json.push_str(", \"maximized\": ");
-        json.push_str(if window.maximized { "true" } else { "false" });
-        json.push('}');
+        members.push(format!(
+            "  \"window\": {{\"x\": {}, \"y\": {}, \"width\": {}, \"height\": {}, \"maximized\": {}}}",
+            f32_literal(window.position[0]),
+            f32_literal(window.position[1]),
+            f32_literal(window.size[0]),
+            f32_literal(window.size[1]),
+            window.maximized
+        ));
     }
-    json.push_str("\n}\n");
-    json
+    members.push(format!("  \"font_size_pt\": {}", config.font_size_pt));
+    members.push(format!(
+        "  \"display\": {}",
+        optional_bool_literal(config.display)
+    ));
+    members.push(format!("  \"theme\": \"{}\"", theme_wire(config.theme)));
+    members.push(format!(
+        "  \"png_background\": \"{}\"",
+        background_wire(config.png_background)
+    ));
+    members.push(format!("  \"dpi\": {}", config.dpi));
+    members.push(format!(
+        "  \"markdown_flavor\": {}",
+        match config.markdown_flavor.and_then(flavor_wire) {
+            Some(flavor) => format!("\"{flavor}\""),
+            None => "null".to_owned(),
+        }
+    ));
+    members.push(format!(
+        "  \"exit_policy\": \"{}\"",
+        exit_policy_wire(config.exit_policy)
+    ));
+    format!("{{\n{}\n}}\n", members.join(",\n"))
+}
+
+/// Quotes a list of identifiers in one line, escaping each value.
+fn quoted_list(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| {
+            let mut quoted = String::with_capacity(value.len() + 2);
+            quoted.push('"');
+            push_escaped(&mut quoted, value);
+            quoted.push('"');
+            quoted
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Appends an `f32` without a trailing `.0`, so the document stays readable.
-fn push_f32(output: &mut String, value: f32) {
-    output.push_str(&format!("{value}"));
+fn f32_literal(value: f32) -> String {
+    format!("{value}")
+}
+
+fn optional_bool_literal(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "null",
+    }
+}
+
+fn theme_wire(theme: ThemeChoice) -> &'static str {
+    match theme {
+        ThemeChoice::System => "system",
+        ThemeChoice::Light => "light",
+        ThemeChoice::Dark => "dark",
+    }
+}
+
+fn theme_from_wire(value: &str) -> Option<ThemeChoice> {
+    match value {
+        "system" => Some(ThemeChoice::System),
+        "light" => Some(ThemeChoice::Light),
+        "dark" => Some(ThemeChoice::Dark),
+        _ => None,
+    }
+}
+
+fn background_wire(background: PngBackgroundChoice) -> &'static str {
+    match background {
+        PngBackgroundChoice::Transparent => "transparent",
+        PngBackgroundChoice::White => "white",
+    }
+}
+
+fn background_from_wire(value: &str) -> Option<PngBackgroundChoice> {
+    match value {
+        "transparent" => Some(PngBackgroundChoice::Transparent),
+        "white" => Some(PngBackgroundChoice::White),
+        _ => None,
+    }
+}
+
+/// Maps a selectable flavor to its JSON literal; the internal pass-through
+/// form [`Delimiter::None`] is not selectable and serializes as `null`.
+fn flavor_wire(flavor: Delimiter) -> Option<&'static str> {
+    match flavor {
+        Delimiter::Inline => Some("inline"),
+        Delimiter::Display => Some("display"),
+        Delimiter::Fenced => Some("fenced"),
+        Delimiter::None => None,
+    }
+}
+
+fn flavor_from_wire(value: &str) -> Option<Delimiter> {
+    match value {
+        "inline" => Some(Delimiter::Inline),
+        "display" => Some(Delimiter::Display),
+        "fenced" => Some(Delimiter::Fenced),
+        _ => None,
+    }
+}
+
+fn exit_policy_wire(policy: ExitSavePolicy) -> &'static str {
+    match policy {
+        ExitSavePolicy::FileExportOnly => "file_export_only",
+        ExitSavePolicy::AnyOutput => "any_output",
+    }
+}
+
+fn exit_policy_from_wire(value: &str) -> Option<ExitSavePolicy> {
+    match value {
+        "file_export_only" => Some(ExitSavePolicy::FileExportOnly),
+        "any_output" => Some(ExitSavePolicy::AnyOutput),
+        _ => None,
+    }
 }
 
 fn push_escaped(output: &mut String, value: &str) {
@@ -238,6 +375,13 @@ fn parse_json(text: &str) -> Result<Config, String> {
     let mut version = CONFIG_VERSION;
     let mut favorites = None;
     let mut window = None;
+    let mut font_size_pt = DEFAULT_FONT_SIZE_PT;
+    let mut display = None;
+    let mut theme = ThemeChoice::System;
+    let mut png_background = DEFAULT_BACKGROUND;
+    let mut dpi = DEFAULT_DPI;
+    let mut markdown_flavor = None;
+    let mut exit_policy = ExitSavePolicy::default();
     loop {
         let key = cursor.parse_string()?;
         cursor.expect(':')?;
@@ -245,6 +389,33 @@ fn parse_json(text: &str) -> Result<Config, String> {
             "version" => version = cursor.parse_u32()?,
             "favorites" => favorites = Some(cursor.parse_string_array()?),
             "window" => window = cursor.parse_optional_window()?,
+            "font_size_pt" => font_size_pt = i64::from(cursor.parse_u32()?),
+            "display" => display = cursor.parse_optional_bool()?,
+            "theme" => {
+                let value = cursor.parse_string()?;
+                theme = theme_from_wire(&value)
+                    .ok_or_else(|| cursor.error(&format!("未知主题 \"{value}\"")))?;
+            }
+            "png_background" => {
+                let value = cursor.parse_string()?;
+                png_background = background_from_wire(&value)
+                    .ok_or_else(|| cursor.error(&format!("未知 PNG 背景 \"{value}\"")))?;
+            }
+            "dpi" => dpi = i64::from(cursor.parse_u32()?),
+            "markdown_flavor" => {
+                markdown_flavor =
+                    match cursor.parse_optional_string()?.as_deref() {
+                        None => None,
+                        Some(value) => Some(flavor_from_wire(value).ok_or_else(|| {
+                            cursor.error(&format!("未知 Markdown 形态 \"{value}\""))
+                        })?),
+                    };
+            }
+            "exit_policy" => {
+                let value = cursor.parse_string()?;
+                exit_policy = exit_policy_from_wire(&value)
+                    .ok_or_else(|| cursor.error(&format!("未知退出提示策略 \"{value}\"")))?;
+            }
             other => return Err(cursor.error(&format!("未知字段 \"{other}\""))),
         }
         cursor.skip_whitespace();
@@ -261,6 +432,13 @@ fn parse_json(text: &str) -> Result<Config, String> {
         version,
         favorites: favorites.unwrap_or_else(catalog::default_favorites),
         window,
+        font_size_pt,
+        display,
+        theme,
+        png_background,
+        dpi,
+        markdown_flavor,
+        exit_policy,
     };
     cursor.finish(config)
 }
@@ -405,11 +583,37 @@ impl<'a> JsonCursor<'a> {
         Err(self.error("期望 true 或 false"))
     }
 
+    /// Parses an optional boolean member; `null` explicitly clears the choice.
+    fn parse_optional_bool(&mut self) -> Result<Option<bool>, String> {
+        self.skip_whitespace();
+        if self.consume_null() {
+            return Ok(None);
+        }
+        self.parse_bool().map(Some)
+    }
+
+    /// Parses an optional string member; `null` explicitly clears the choice.
+    fn parse_optional_string(&mut self) -> Result<Option<String>, String> {
+        self.skip_whitespace();
+        if self.consume_null() {
+            return Ok(None);
+        }
+        self.parse_string().map(Some)
+    }
+
+    /// Consumes the `null` literal when present and reports whether it matched.
+    fn consume_null(&mut self) -> bool {
+        if self.text[self.position..].starts_with("null") {
+            self.position += "null".len();
+            return true;
+        }
+        false
+    }
+
     /// Parses the optional `window` member; `null` explicitly disables it.
     fn parse_optional_window(&mut self) -> Result<Option<WindowGeometry>, String> {
         self.skip_whitespace();
-        if self.text[self.position..].starts_with("null") {
-            self.position += "null".len();
+        if self.consume_null() {
             return Ok(None);
         }
         self.expect('{')?;
@@ -528,6 +732,61 @@ mod tests {
         let config = load_from(&path).expect("load must succeed");
         assert_eq!(config.window, Some(window));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn roundtrip_preserves_settings() {
+        let path = temporary_path("settings");
+        let config = Config {
+            font_size_pt: 22,
+            display: Some(true),
+            theme: ThemeChoice::Dark,
+            png_background: PngBackgroundChoice::White,
+            dpi: 600,
+            markdown_flavor: Some(Delimiter::Fenced),
+            exit_policy: ExitSavePolicy::AnyOutput,
+            ..Config::default()
+        };
+        save_to(&path, &config).expect("save must succeed");
+        let loaded = load_from(&path).expect("load must succeed");
+        assert_eq!(loaded.font_size_pt, 22);
+        assert_eq!(loaded.display, Some(true));
+        assert_eq!(loaded.theme, ThemeChoice::Dark);
+        assert_eq!(loaded.png_background, PngBackgroundChoice::White);
+        assert_eq!(loaded.dpi, 600);
+        assert_eq!(loaded.markdown_flavor, Some(Delimiter::Fenced));
+        assert_eq!(loaded.exit_policy, ExitSavePolicy::AnyOutput);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn missing_settings_use_defaults() {
+        let config = parse_json(r#"{"version":1}"#).expect("partial config must parse");
+        let defaults = Config::default();
+        assert_eq!(config.font_size_pt, defaults.font_size_pt);
+        assert_eq!(config.display, defaults.display);
+        assert_eq!(config.theme, defaults.theme);
+        assert_eq!(config.png_background, defaults.png_background);
+        assert_eq!(config.dpi, defaults.dpi);
+        assert_eq!(config.markdown_flavor, defaults.markdown_flavor);
+        assert_eq!(config.exit_policy, defaults.exit_policy);
+    }
+
+    #[test]
+    fn out_of_range_settings_fall_back() {
+        let config = parse_json(r#"{"font_size_pt":99,"dpi":123}"#)
+            .expect("numeric settings must parse")
+            .sanitized();
+        assert_eq!(config.font_size_pt, *FONT_SIZE_RANGE.end());
+        assert_eq!(config.dpi, DEFAULT_DPI);
+    }
+
+    #[test]
+    fn unknown_setting_values_are_rejected() {
+        assert!(parse_json(r#"{"theme":"neon"}"#).is_err());
+        assert!(parse_json(r#"{"png_background":"blue"}"#).is_err());
+        assert!(parse_json(r#"{"markdown_flavor":"none"}"#).is_err());
+        assert!(parse_json(r#"{"exit_policy":"sometimes"}"#).is_err());
     }
 
     #[test]

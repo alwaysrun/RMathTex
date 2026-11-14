@@ -40,6 +40,19 @@ fn roundtrip(text: &str) -> NormalizedSource {
 }
 
 #[test]
+fn office_rows_keep_line_breaks() {
+    let rows = ["a+b", "", "c"];
+    let mathml = convert::rows_to_mathml(&rows, true).expect("mathml");
+    assert_eq!(mathml.matches("<mtr>").count(), 3, "{mathml}");
+    assert!(mathml.contains("<mtable>"), "{mathml}");
+    assert!(mathml.contains("<mtd></mtd>"), "{mathml}");
+    let omml = convert::rows_to_omml(&rows).expect("omml");
+    assert_eq!(omml.matches("<m:e>").count(), 3, "{omml}");
+    assert!(omml.contains("<m:eqArr>"), "{omml}");
+    assert!(omml.contains("<m:e></m:e>"), "{omml}");
+}
+
+#[test]
 fn markdown_roundtrip_all_flavors() {
     let bodies = [
         "\\frac{a}{b}",

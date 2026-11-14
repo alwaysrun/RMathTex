@@ -14,18 +14,18 @@ use crate::linearmath;
 use crate::model::{
     self, to_markdown, AppError, CoverageLevel, Delimiter, ExitSavePolicy, ExportStyle,
     ExportTarget, Level, NormalizedSource, Notice, PngBackgroundChoice, RenderKey, Rendered,
-    ThemeChoice, AUTO_FLAVOR_FALLBACK, CONFIG_VERSION, DEBOUNCE_MS, DEFAULT_BACKGROUND,
-    DEFAULT_DPI, DEFAULT_FONT_SIZE_PT, DIALOG_ACTIONS_GAP, DIALOG_TEXT_SLACK, DPI_CHOICES,
-    EDITOR_ROWS, FONT_SIZE_RANGE, HINT_COPY_MARKDOWN, HINT_COPY_OFFICE, HINT_EXIT_POLICY,
-    MSG_CANCELLED, MSG_CONFIG_SAVED, MSG_COPY_OK, MSG_DOCX_OMML_FAILED, MSG_EMPTY_SOURCE,
-    MSG_EXIT_UNSAVED, MSG_EXPORT_OK, MSG_EXTENDED, MSG_IMPORT_OK, MSG_MATHML_UNAVAILABLE,
-    MSG_MD_COPY_OK, MSG_MD_EXPORT_OK, MSG_OMML_UNAVAILABLE, MSG_PLAIN_ONLY, MSG_READY,
-    MSG_UI_FONT_MISSING, MSG_UNSUPPORTED, SOURCE_PANEL_FRACTION, TEXT_EDIT_MARGIN_Y,
+    ThemeChoice, AUTO_FLAVOR_FALLBACK, CONFIG_VERSION, DEBOUNCE_MS, DIALOG_ACTIONS_GAP,
+    DIALOG_TEXT_SLACK, DPI_CHOICES, EDITOR_ROWS, FONT_SIZE_RANGE, HINT_COPY_MARKDOWN,
+    HINT_COPY_OFFICE, HINT_EXIT_POLICY, MSG_CANCELLED, MSG_CONFIG_SAVED, MSG_COPY_OK,
+    MSG_DOCX_OMML_FAILED, MSG_EMPTY_SOURCE, MSG_EXIT_UNSAVED, MSG_EXPORT_OK, MSG_EXTENDED,
+    MSG_IMPORT_OK, MSG_MATHML_UNAVAILABLE, MSG_MD_COPY_OK, MSG_MD_EXPORT_OK, MSG_OMML_UNAVAILABLE,
+    MSG_PLAIN_ONLY, MSG_READY, MSG_UI_FONT_MISSING, MSG_UNSUPPORTED, SOURCE_PANEL_FRACTION,
+    TEXT_EDIT_MARGIN_Y,
 };
 use crate::render::Renderer;
 
-/// All in-memory state of the editor; only the favorites list and the window
-/// rectangle are persisted.
+/// All in-memory state of the editor; the favorites list, the window rectangle
+/// and the settings-menu choices are persisted through [`config::Config`].
 pub struct RMathTexApp {
     source: String,
     normalized: NormalizedSource,
@@ -68,12 +68,13 @@ impl RMathTexApp {
         startup: Result<config::Config, AppError>,
     ) -> Result<Self, AppError> {
         let renderer = Renderer::new()?;
-        let (favorites, window, config_error) = match startup {
-            Ok(config) => (config.favorites, config.window, None),
-            Err(error) => (catalog::default_favorites(), None, Some(error)),
+        let (settings, config_error) = match startup {
+            Ok(config) => (config, None),
+            Err(error) => (config::Config::default(), Some(error)),
         };
         let font_ready = install_ui_font(&creation.egui_ctx);
         let config_loaded = config_error.is_none();
+        apply_window_theme(&creation.egui_ctx, settings.theme);
         let notice = match (config_error, font_ready) {
             (Some(error), false) => Notice::warn(
                 error.code,
@@ -89,18 +90,18 @@ impl RMathTexApp {
             renderer,
             cache: None,
             last_edit: None,
-            font_size_pt: DEFAULT_FONT_SIZE_PT,
-            display_override: None,
-            theme: ThemeChoice::System,
-            dpi: DEFAULT_DPI,
-            png_background: DEFAULT_BACKGROUND,
-            markdown_flavor: None,
-            favorites,
-            window,
+            font_size_pt: settings.font_size_pt,
+            display_override: settings.display,
+            theme: settings.theme,
+            dpi: settings.dpi,
+            png_background: settings.png_background,
+            markdown_flavor: settings.markdown_flavor,
+            favorites: settings.favorites,
+            window: settings.window,
             config_loaded,
             show_favorites_manager: false,
             notice,
-            exit_policy: ExitSavePolicy::default(),
+            exit_policy: settings.exit_policy,
             exported_since_edit: false,
             copied_since_edit: false,
             show_exit_confirm: false,
@@ -307,8 +308,18 @@ impl RMathTexApp {
             self.notice = Notice::error("E302", text);
             return;
         }
-        let mathml = convert::to_mathml(&body, display).ok();
-        let omml = convert::to_omml(&body).ok();
+        let rows = model::source_rows(&body);
+        let (mathml, omml) = if rows.len() > 1 {
+            (
+                convert::rows_to_mathml(&rows, display).ok(),
+                convert::rows_to_omml(&rows).ok(),
+            )
+        } else {
+            (
+                convert::to_mathml(&body, display).ok(),
+                convert::to_omml(&body).ok(),
+            )
+        };
         let written = match clipboard::write_office(&body, mathml.as_deref(), omml.as_deref()) {
             Ok(written) => written,
             Err(error) => return self.fail(error),
@@ -420,12 +431,27 @@ impl RMathTexApp {
     fn build_export(&self, target: ExportTarget, style: &ExportStyle) -> Result<Vec<u8>, AppError> {
         let body = &self.normalized.body;
         match target {
-            ExportTarget::Svg => Ok(export::svg(body, style, self.renderer.font())?.into_bytes()),
-            ExportTarget::Png => export::png(body, style, self.renderer.font()),
+            ExportTarget::Svg => {
+                let tree = self.renderer.layout_export(body, style)?;
+                Ok(export::svg(&tree, style, self.renderer.font())?.into_bytes())
+            }
+            ExportTarget::Png => {
+                let tree = self.renderer.layout_export(body, style)?;
+                export::png(&tree, style, self.renderer.font())
+            }
             ExportTarget::Docx => {
-                let omml = convert::to_omml(body)
+                let rows = model::source_rows(body)
+                    .into_iter()
+                    .map(|row| {
+                        if row.is_empty() {
+                            Ok(None)
+                        } else {
+                            convert::to_omml(row).map(Some)
+                        }
+                    })
+                    .collect::<Result<Vec<_>, AppError>>()
                     .map_err(|error| AppError::caused("E602", MSG_DOCX_OMML_FAILED, error))?;
-                export::docx(&omml, style.display)
+                export::docx(&rows, style.display)
             }
             ExportTarget::Markdown => Ok(self.markdown_output().into_bytes()),
         }
@@ -435,11 +461,13 @@ impl RMathTexApp {
         let copy = KeyboardShortcut::new(Modifiers::CTRL | Modifiers::SHIFT, Key::C);
         let paste = KeyboardShortcut::new(Modifiers::CTRL | Modifiers::SHIFT, Key::V);
         let markdown = KeyboardShortcut::new(Modifiers::CTRL | Modifiers::SHIFT, Key::M);
-        let (copy, paste, markdown) = ctx.input_mut(|input| {
+        let blank_line = KeyboardShortcut::new(Modifiers::CTRL, Key::Enter);
+        let (copy, paste, markdown, blank_line) = ctx.input_mut(|input| {
             (
                 input.consume_shortcut(&copy),
                 input.consume_shortcut(&paste),
                 input.consume_shortcut(&markdown),
+                input.consume_shortcut(&blank_line),
             )
         });
         if copy {
@@ -464,6 +492,9 @@ impl RMathTexApp {
         }
         if markdown {
             self.copy_markdown();
+        }
+        if blank_line {
+            self.insert_blank_line(ctx, true);
         }
     }
 
@@ -514,6 +545,14 @@ impl RMathTexApp {
                     ui.close_menu();
                     self.copy_markdown();
                 }
+                ui.separator();
+                if ui
+                    .add(egui::Button::new("插入空行").shortcut_text("Ctrl+Enter"))
+                    .clicked()
+                {
+                    ui.close_menu();
+                    self.insert_blank_line(ctx, false);
+                }
             });
             ui.menu_button("公式", |ui| self.formula_menu(ctx, ui));
             ui.menu_button("设置", |ui| self.settings_menu(ctx, ui));
@@ -547,16 +586,24 @@ impl RMathTexApp {
 
     fn settings_menu(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         ui.menu_button("字号", |ui| {
-            ui.add(egui::Slider::new(&mut self.font_size_pt, FONT_SIZE_RANGE).suffix(" pt"));
+            let response =
+                ui.add(egui::Slider::new(&mut self.font_size_pt, FONT_SIZE_RANGE).suffix(" pt"));
+            // The slider reports `changed` on every drag frame, so persist once
+            // the drag ends (or immediately for keyboard adjustments).
+            if response.drag_stopped() || (response.changed() && !response.dragged()) {
+                self.persist_config();
+            }
         });
         ui.menu_button("排版", |ui| {
             let display = self.display();
             if ui.radio(display, "Display").clicked() {
                 self.display_override = Some(true);
+                self.persist_config();
                 ui.close_menu();
             }
             if ui.radio(!display, "Text").clicked() {
                 self.display_override = Some(false);
+                self.persist_config();
                 ui.close_menu();
             }
         });
@@ -569,6 +616,7 @@ impl RMathTexApp {
                 if ui.radio(self.theme == value, label).clicked() {
                     self.theme = value;
                     apply_window_theme(ctx, value);
+                    self.persist_config();
                     ui.close_menu();
                 }
             }
@@ -580,6 +628,7 @@ impl RMathTexApp {
             ] {
                 if ui.radio(self.png_background == value, label).clicked() {
                     self.png_background = value;
+                    self.persist_config();
                     ui.close_menu();
                 }
             }
@@ -588,6 +637,7 @@ impl RMathTexApp {
             for dpi in DPI_CHOICES {
                 if ui.radio(self.dpi == dpi, dpi.to_string()).clicked() {
                     self.dpi = dpi;
+                    self.persist_config();
                     ui.close_menu();
                 }
             }
@@ -598,6 +648,7 @@ impl RMathTexApp {
                 .clicked()
             {
                 self.markdown_flavor = None;
+                self.persist_config();
                 ui.close_menu();
             }
             for delimiter in [Delimiter::Inline, Delimiter::Display, Delimiter::Fenced] {
@@ -609,6 +660,7 @@ impl RMathTexApp {
                     .clicked()
                 {
                     self.markdown_flavor = Some(delimiter);
+                    self.persist_config();
                     ui.close_menu();
                 }
             }
@@ -633,6 +685,7 @@ impl RMathTexApp {
                     .clicked()
                 {
                     self.exit_policy = value;
+                    self.persist_config();
                     ui.close_menu();
                 }
             }
@@ -739,7 +792,7 @@ impl RMathTexApp {
                                         .changed()
                                     {
                                         self.set_favorite(entry.id, checked);
-                                        self.persist_favorites();
+                                        self.persist_config();
                                     }
                                 }
                             });
@@ -765,10 +818,10 @@ impl RMathTexApp {
 
     fn reset_favorites(&mut self) {
         self.favorites = catalog::default_favorites();
-        self.persist_favorites();
+        self.persist_config();
     }
 
-    fn persist_favorites(&mut self) {
+    fn persist_config(&mut self) {
         match config::save(&self.config_snapshot()) {
             Ok(path) => {
                 self.config_loaded = true;
@@ -785,6 +838,13 @@ impl RMathTexApp {
             version: CONFIG_VERSION,
             favorites: self.favorites.clone(),
             window: self.window,
+            font_size_pt: self.font_size_pt,
+            display: self.display_override,
+            theme: self.theme,
+            png_background: self.png_background,
+            dpi: self.dpi,
+            markdown_flavor: self.markdown_flavor,
+            exit_policy: self.exit_policy,
         }
     }
 
@@ -843,6 +903,40 @@ impl RMathTexApp {
         let end_byte = char_to_byte(&self.source, end);
         self.source.replace_range(start_byte..end_byte, snippet);
         let cursor = start + snippet.chars().count();
+        state
+            .cursor
+            .set_char_range(Some(CCursorRange::one(CCursor::new(cursor))));
+        state.store(ctx, id);
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        self.on_source_changed();
+    }
+
+    /// Inserts an empty line below the caret line, like an IDE's insert-line-below.
+    ///
+    /// `require_focus` keeps Ctrl+Enter from editing a pane the user is not
+    /// typing in; the menu entry passes `false` because opening the menu already
+    /// moved focus away from the editor.
+    fn insert_blank_line(&mut self, ctx: &egui::Context, require_focus: bool) {
+        let id = Self::editor_id();
+        if require_focus && !ctx.memory(|memory| memory.has_focus(id)) {
+            return;
+        }
+        let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+        let total = self.source.chars().count();
+        let caret = state
+            .cursor
+            .char_range()
+            .map_or(total, |range| range.primary.index.min(total));
+        let line_end = caret
+            + self
+                .source
+                .chars()
+                .skip(caret)
+                .take_while(|character| *character != '\n')
+                .count();
+        self.source
+            .insert(char_to_byte(&self.source, line_end), '\n');
+        let cursor = line_end + 1;
         state
             .cursor
             .set_char_range(Some(CCursorRange::one(CCursor::new(cursor))));

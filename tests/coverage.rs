@@ -163,10 +163,17 @@ fn four_chain_failures(formulas: &[&str]) -> Vec<String> {
         if let Err(error) = convert::to_omml(formula) {
             failures.push(format!("omml     | {formula} | {error}"));
         }
-        if let Err(error) = export::svg(formula, &style, renderer.font()) {
+        let tree = match renderer.layout_export(formula, &style) {
+            Ok(tree) => tree,
+            Err(error) => {
+                failures.push(format!("layout   | {formula} | {error}"));
+                continue;
+            }
+        };
+        if let Err(error) = export::svg(&tree, &style, renderer.font()) {
             failures.push(format!("svg      | {formula} | {error}"));
         }
-        if let Err(error) = export::png(formula, &style, renderer.font()) {
+        if let Err(error) = export::png(&tree, &style, renderer.font()) {
             failures.push(format!("png      | {formula} | {error}"));
         }
     }
@@ -201,7 +208,10 @@ fn extended_degrades_with_notice() {
         renderer
             .render(formula, key, egui::Pos2::ZERO)
             .unwrap_or_else(|error| panic!("preview {formula}: {error}"));
-        export::svg(formula, &style, renderer.font())
+        let tree = renderer
+            .layout_export(formula, &style)
+            .unwrap_or_else(|error| panic!("layout {formula}: {error}"));
+        export::svg(&tree, &style, renderer.font())
             .unwrap_or_else(|error| panic!("svg {formula}: {error}"));
         assert!(!model::to_markdown(formula, Delimiter::Display).is_empty());
     }

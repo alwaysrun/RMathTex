@@ -62,7 +62,7 @@ pub const MD_FENCE_CLOSE: &str = "\n```";
 /// Configuration file name, stored next to the executable.
 pub const CONFIG_FILE_NAME: &str = "RMathTex.json";
 /// Schema version written to the configuration file.
-pub const CONFIG_VERSION: u32 = 1;
+pub const CONFIG_VERSION: u32 = 2;
 
 /// Prefix/suffix table of [`to_markdown`]; the four rows are the format contract.
 ///
@@ -143,13 +143,13 @@ pub const MSG_DOCX_OMML_FAILED: &str = "docx 所需 OMML 转换失败";
 /// No system CJK font was readable, so UI labels may fall back to tofu boxes.
 pub const MSG_UI_FONT_MISSING: &str = "未找到系统中文字体，界面文字可能显示为方块";
 /// Configuration file could not be read or parsed.
-pub const MSG_CONFIG_LOAD_FAILED: &str = "常用公式配置读取失败，已使用默认配置";
+pub const MSG_CONFIG_LOAD_FAILED: &str = "配置读取失败，已使用默认配置";
 /// Configuration file could not be written.
-pub const MSG_CONFIG_SAVE_FAILED: &str = "常用公式配置保存失败";
+pub const MSG_CONFIG_SAVE_FAILED: &str = "配置保存失败";
 /// The executable directory is unavailable, so no configuration path exists.
-pub const MSG_CONFIG_PATH_FAILED: &str = "无法定位程序所在目录，常用公式配置不可用";
+pub const MSG_CONFIG_PATH_FAILED: &str = "无法定位程序所在目录，配置不可用";
 /// `{path}` = configuration file path.
-pub const MSG_CONFIG_SAVED: &str = "常用公式配置已保存：{path}";
+pub const MSG_CONFIG_SAVED: &str = "配置已保存：{path}";
 /// Toolbar hover text: action name, effect and shortcut of the Office copy button.
 pub const HINT_COPY_OFFICE: &str =
     "复制为 Office 公式（Ctrl+Shift+C）\n写入 MathML / OMML / HTML，Word / PPT / WPS 中粘贴得可编辑公式";
@@ -554,6 +554,55 @@ pub fn normalize_source(raw: &str) -> NormalizedSource {
     normalized(raw, trimmed.to_owned(), None, Delimiter::None, None)
 }
 
+/// Splits a normalized body at hard newlines, keeping blank rows.
+///
+/// A newline inside braces or an environment belongs to the row that contains
+/// it, so `aligned` and matrix rows stay intact. Every row is trimmed and blank
+/// rows stay as `""`: callers can turn them into vertical gaps instead of
+/// silently dropping them.
+#[must_use]
+pub fn source_rows(src: &str) -> Vec<&str> {
+    let bytes = src.as_bytes();
+    let mut rows = Vec::new();
+    let mut start = 0usize;
+    let mut braces = 0usize;
+    let mut environments = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => {
+                let name_start = index + 1;
+                let mut name_end = name_start;
+                while name_end < bytes.len() && bytes[name_end].is_ascii_alphabetic() {
+                    name_end += 1;
+                }
+                if name_end == name_start {
+                    // Escaped character such as `\\` or `\{`; both bytes are literal.
+                    index = name_start + 1;
+                } else {
+                    match &src[name_start..name_end] {
+                        "begin" => environments += 1,
+                        "end" => environments = environments.saturating_sub(1),
+                        _ => {}
+                    }
+                    index = name_end;
+                }
+                continue;
+            }
+            b'{' => braces += 1,
+            b'}' => braces = braces.saturating_sub(1),
+            b'\n' if braces == 0 && environments == 0 => {
+                rows.push(src[start..index].trim());
+                start = index + 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    rows.push(src[start..].trim());
+    rows
+}
+
 /// Wraps a normalized body in the delimiters of `flavor`; inverse of [`normalize_source`].
 #[must_use]
 pub fn to_markdown(body: &str, flavor: Delimiter) -> String {
@@ -658,5 +707,18 @@ mod tests {
         for policy in [ExitSavePolicy::FileExportOnly, ExitSavePolicy::AnyOutput] {
             assert!(!policy.requires_confirmation(false, false, false));
         }
+    }
+
+    #[test]
+    fn source_rows_keep_blank_lines() {
+        assert_eq!(source_rows("x\n\n  y  \n"), vec!["x", "", "y", ""]);
+    }
+
+    #[test]
+    fn source_rows_keep_environment_newlines() {
+        assert_eq!(
+            source_rows("\\begin{pmatrix}\n1 & 2 \\\\\n3 & 4\n\\end{pmatrix}\nc"),
+            vec!["\\begin{pmatrix}\n1 & 2 \\\\\n3 & 4\n\\end{pmatrix}", "c"]
+        );
     }
 }

@@ -18,6 +18,7 @@ use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
 use export::atomic_write;
+use latex_rust::MathBox;
 use model::{Delimiter, ExportStyle, EXPORT_COLOR};
 use render::Renderer;
 
@@ -31,10 +32,20 @@ fn style() -> ExportStyle {
     ExportStyle::default()
 }
 
+fn tree(renderer: &Renderer, src: &str, style: &ExportStyle) -> MathBox {
+    renderer.layout_export(src, style).expect("layout")
+}
+
 #[test]
 fn svg_is_self_contained() {
     let renderer = renderer();
-    let svg = export::svg("\\frac{a}{b}", &style(), renderer.font()).expect("svg");
+    let style = style();
+    let svg = export::svg(
+        &tree(&renderer, "\\frac{a}{b}", &style),
+        &style,
+        renderer.font(),
+    )
+    .expect("svg");
     // The serializer may emit an XML declaration before the root element.
     assert!(svg.contains("<svg"), "{svg}");
     assert!(svg.trim_end().ends_with("</svg>"), "{svg}");
@@ -50,7 +61,8 @@ fn svg_is_self_contained() {
 #[test]
 fn png_header_and_alpha() {
     let renderer = renderer();
-    let bytes = export::png("x^2", &style(), renderer.font()).expect("png");
+    let style = style();
+    let bytes = export::png(&tree(&renderer, "x^2", &style), &style, renderer.font()).expect("png");
     assert_eq!(&bytes[..8], &PNG_SIGNATURE);
     assert_eq!(&bytes[12..16], b"IHDR");
     let width = u32::from_be_bytes(bytes[16..20].try_into().expect("width"));
@@ -60,17 +72,21 @@ fn png_header_and_alpha() {
     assert!(width > 0 && height > 0, "{width}x{height}");
     assert_eq!(bit_depth, 8);
     assert_eq!(color_type, 6, "RGBA is required for transparent background");
-    let mut out_of_range = style();
+    let mut out_of_range = style;
     out_of_range.dpi = 0;
-    let error =
-        export::png("x^2", &out_of_range, renderer.font()).expect_err("dpi must be checked");
+    let error = export::png(
+        &tree(&renderer, "x^2", &out_of_range),
+        &out_of_range,
+        renderer.font(),
+    )
+    .expect_err("dpi must be checked");
     assert_eq!(error.code, "E601");
 }
 
 #[test]
 fn docx_zip_parts_and_omml() {
     let omml = convert::to_omml("\\frac{a}{b}").expect("omml");
-    let bytes = export::docx(&omml, true).expect("docx");
+    let bytes = export::docx(&[Some(omml)], true).expect("docx");
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).expect("zip");
     let mut names: Vec<String> = archive
         .file_names()
@@ -98,13 +114,54 @@ fn docx_zip_parts_and_omml() {
 }
 
 #[test]
+fn docx_keeps_blank_source_lines() {
+    let first = convert::to_omml("x").expect("omml");
+    let second = convert::to_omml("y").expect("omml");
+    let bytes = export::docx(&[Some(first), None, Some(second)], true).expect("docx");
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).expect("zip");
+    let mut document = String::new();
+    archive
+        .by_name("word/document.xml")
+        .expect("document part")
+        .read_to_string(&mut document)
+        .expect("read document");
+    assert_eq!(document.matches("<w:p>").count(), 2, "{document}");
+    assert_eq!(document.matches("<w:p/>").count(), 1, "{document}");
+}
+
+#[test]
+fn png_preserves_blank_line_height() {
+    let renderer = renderer();
+    let style = style();
+    let compact = export::png(&tree(&renderer, "x\ny", &style), &style, renderer.font())
+        .expect("compact png");
+    let spaced = export::png(&tree(&renderer, "x\n\ny", &style), &style, renderer.font())
+        .expect("spaced png");
+    let height = |bytes: &[u8]| u32::from_be_bytes(bytes[20..24].try_into().expect("height"));
+    assert!(
+        height(&spaced) > height(&compact),
+        "a blank line must enlarge the exported image"
+    );
+}
+
+#[test]
 fn export_style_theme_independent() {
     let renderer = renderer();
     let defaults = style();
     assert_eq!(defaults.color, EXPORT_COLOR);
     assert_eq!(defaults.font_size_pt, model::DEFAULT_EXPORT_FONT_SIZE_PT);
-    let first = export::svg("x^2", &defaults, renderer.font()).expect("svg");
-    let second = export::svg("x^2", &defaults, renderer.font()).expect("svg");
+    let first = export::svg(
+        &tree(&renderer, "x^2", &defaults),
+        &defaults,
+        renderer.font(),
+    )
+    .expect("svg");
+    let second = export::svg(
+        &tree(&renderer, "x^2", &defaults),
+        &defaults,
+        renderer.font(),
+    )
+    .expect("svg");
     assert_eq!(first, second, "export output must be deterministic");
     assert!(first.contains("fill=\"#000000\""), "fixed black fill");
     let markdown = model::to_markdown("x^2", Delimiter::Inline);
@@ -131,13 +188,14 @@ fn markdown_file_is_single_formula_fragment() {
 #[test]
 fn save_cancel_writes_nothing() {
     let renderer = renderer();
+    let style = style();
     let directory = unique_directory();
     let target = directory.join("formula.svg");
     // Producing payloads never touches the file system.
-    let svg = export::svg("x^2", &style(), renderer.font()).expect("svg");
-    let png = export::png("x^2", &style(), renderer.font()).expect("png");
+    let svg = export::svg(&tree(&renderer, "x^2", &style), &style, renderer.font()).expect("svg");
+    let png = export::png(&tree(&renderer, "x^2", &style), &style, renderer.font()).expect("png");
     let omml = convert::to_omml("x^2").expect("omml");
-    let docx = export::docx(&omml, false).expect("docx");
+    let docx = export::docx(&[Some(omml)], false).expect("docx");
     assert!(!target.exists(), "payload generation must not write files");
     assert!(svg.contains("<svg") && !png.is_empty() && !docx.is_empty());
     // The atomic writer is the only writer and leaves no temporary behind.
