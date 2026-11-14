@@ -1,0 +1,30 @@
+[package]
+name = "r-math-tex"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97"
+description = "RMathTex - a Windows-only desktop LaTeX formula editor with Office interop"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "RMathTex"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "=0.28.1", default-features = false, features = ["glow", "default_fonts"] }
+latex-rust = { version = "=2.1.1", features = ["egui", "png"] }
+easydoc-math = "=0.1.2"
+latex2mathml = "=0.2.3"
+clipboard-win = "=5.4.3"
+zip = { version = "=9.5.1", default-features = false }
+rfd = { version = "=0.18.0", default-features = false }
+thiserror = "=2.0.21"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[dev-dependencies]
+criterion = "0.5"
