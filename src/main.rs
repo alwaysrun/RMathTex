@@ -63,8 +63,12 @@ fn read_u32(bytes: &[u8]) -> Option<usize> {
 fn main() -> eframe::Result {
     // Loading once keeps the restored geometry and the in-app notice consistent.
     let startup = config::load();
+    let restored = startup.as_ref().ok().and_then(|config| config.window);
     let options = eframe::NativeOptions {
-        viewport: viewport_builder(startup.as_ref().ok()),
+        viewport: viewport_builder(restored),
+        // A first start has no saved rectangle, so center on the primary
+        // monitor instead of leaving the window at the OS default position.
+        centered: restored.is_none(),
         ..Default::default()
     };
     eframe::run_native(
@@ -75,12 +79,12 @@ fn main() -> eframe::Result {
 }
 
 /// Applies the persisted window rectangle when the configuration was readable.
-fn viewport_builder(config: Option<&config::Config>) -> egui::ViewportBuilder {
+fn viewport_builder(restored: Option<config::WindowGeometry>) -> egui::ViewportBuilder {
     let mut builder = egui::ViewportBuilder::default()
         .with_inner_size(model::WINDOW_SIZE)
         .with_min_inner_size(model::MIN_WINDOW_SIZE)
         .with_icon(window_icon());
-    if let Some(window) = config.and_then(|config| config.window) {
+    if let Some(window) = restored {
         builder = builder
             .with_inner_size(window.size)
             .with_position(window.position)

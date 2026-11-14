@@ -43,6 +43,10 @@ pub const EDITOR_ROWS: usize = 4;
 pub const TEXT_EDIT_MARGIN_Y: f32 = 4.0;
 /// Share of the workspace height the source editor occupies by default.
 pub const SOURCE_PANEL_FRACTION: f32 = 1.0 / 3.0;
+/// Gap between the confirmation text and its action buttons.
+pub const DIALOG_ACTIONS_GAP: f32 = 6.0;
+/// Slack added to a measured dialog width so rounding never wraps the text.
+pub const DIALOG_TEXT_SLACK: f32 = 2.0;
 /// `CF_UNICODETEXT` clipboard format id.
 pub const CF_UNICODETEXT: u32 = 13;
 /// CF_HTML clipboard format name.
@@ -60,13 +64,15 @@ pub const CONFIG_FILE_NAME: &str = "RMathTex.json";
 /// Schema version written to the configuration file.
 pub const CONFIG_VERSION: u32 = 1;
 
-/// Prefix/suffix table of [`to_markdown`]; the six rows are the format contract.
-pub const MD_DELIMITERS: [(Delimiter, &str, &str); 6] = [
+/// Prefix/suffix table of [`to_markdown`]; the four rows are the format contract.
+///
+/// Only `$…$`, `$$…$$` and the GitHub fence are user-selectable output forms.
+/// `None` stays internal: it lets a bare body pass through unchanged, but the
+/// settings menu never offers it.
+pub const MD_DELIMITERS: [(Delimiter, &str, &str); 4] = [
     (Delimiter::None, "", ""),
     (Delimiter::Inline, "$", "$"),
     (Delimiter::Display, "$$\n", "\n$$"),
-    (Delimiter::MacroInline, "\\(", "\\)"),
-    (Delimiter::MacroDisplay, "\\[", "\\]"),
     (Delimiter::Fenced, MD_FENCE_OPEN, MD_FENCE_CLOSE),
 ];
 
@@ -200,8 +206,24 @@ pub struct Rendered {
     pub key: RenderKey,
     /// Shapes already positioned at the requested origin.
     pub shapes: Vec<eframe::egui::Shape>,
+    /// Characters the math face cannot draw, painted with the UI font on top of
+    /// `shapes` at the positions the layout reserved for them.
+    pub labels: Vec<PreviewLabel>,
     /// Layout bounding rectangle of the expression.
     pub rect: eframe::egui::Rect,
+}
+
+/// Fallback glyph for a character missing from the embedded math face.
+///
+/// The layout reserves the character's width with an invisible placeholder;
+/// the app then paints the real character here with a system font.
+pub struct PreviewLabel {
+    /// Centre of the glyph ink, in the same coordinates as [`Rendered::shapes`].
+    pub center: eframe::egui::Pos2,
+    /// Font size for the glyph, in the same unit as [`Rendered::shapes`].
+    pub size: f32,
+    /// Character to paint.
+    pub text: char,
 }
 
 /// Export-only style, deliberately independent from [`RenderKey`].
@@ -254,6 +276,10 @@ pub enum ExportTarget {
 }
 
 /// Detected input form and requested output form of a formula.
+///
+/// The `\(…\)` and `\[…\]` input forms are normalized to [`Self::Inline`] and
+/// [`Self::Display`] during detection, because only `$…$`, `$$…$$` and the
+/// GitHub fence are supported as output shapes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Delimiter {
     /// Bare LaTeX without delimiters.
@@ -262,10 +288,6 @@ pub enum Delimiter {
     Inline,
     /// `$$...$$`, delimiters on their own lines.
     Display,
-    /// `\(...\)`
-    MacroInline,
-    /// `\[...\]`
-    MacroDisplay,
     /// GitHub `math` fence.
     Fenced,
 }
@@ -278,8 +300,6 @@ impl Delimiter {
             Self::None => "裸 LaTeX",
             Self::Inline => "$…$",
             Self::Display => "$$…$$",
-            Self::MacroInline => "\\(…\\)",
-            Self::MacroDisplay => "\\[…\\]",
             Self::Fenced => "GitHub math 围栏",
         }
     }
@@ -298,9 +318,8 @@ impl Delimiter {
 pub struct NormalizedSource {
     /// Original editor text; never rewritten by an output action.
     ///
-    /// The app keeps the editor buffer separately, so only tests and the
-    /// import path consume this copy of the raw text.
-    #[allow(dead_code)]
+    /// The app compares it with the editor buffer to detect a pending refresh
+    /// that was postponed during IME composition.
     pub raw: String,
     /// Normalized formula body consumed by every output chain.
     pub body: String,
@@ -521,23 +540,13 @@ pub fn normalize_source(raw: &str) -> NormalizedSource {
         }
         return normalized(raw, body.to_owned(), Some(false), Delimiter::Inline, None);
     }
+    // Macro delimiters are accepted on input but normalize to the dollar forms,
+    // which are the only inline/display shapes the Markdown output supports.
     if let Some(body) = strip_pair(trimmed, "\\(", "\\)") {
-        return normalized(
-            raw,
-            body.to_owned(),
-            Some(false),
-            Delimiter::MacroInline,
-            None,
-        );
+        return normalized(raw, body.to_owned(), Some(false), Delimiter::Inline, None);
     }
     if let Some(body) = strip_pair(trimmed, "\\[", "\\]") {
-        return normalized(
-            raw,
-            body.to_owned(),
-            Some(true),
-            Delimiter::MacroDisplay,
-            None,
-        );
+        return normalized(raw, body.to_owned(), Some(true), Delimiter::Display, None);
     }
     if is_single_sided(trimmed) {
         return rejected(raw, trimmed);

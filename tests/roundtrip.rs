@@ -51,8 +51,6 @@ fn markdown_roundtrip_all_flavors() {
         Delimiter::None,
         Delimiter::Inline,
         Delimiter::Display,
-        Delimiter::MacroInline,
-        Delimiter::MacroDisplay,
         Delimiter::Fenced,
     ];
     for body in bodies {

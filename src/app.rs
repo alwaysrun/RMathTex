@@ -15,12 +15,12 @@ use crate::model::{
     self, to_markdown, AppError, CoverageLevel, Delimiter, ExitSavePolicy, ExportStyle,
     ExportTarget, Level, NormalizedSource, Notice, PngBackgroundChoice, RenderKey, Rendered,
     ThemeChoice, AUTO_FLAVOR_FALLBACK, CONFIG_VERSION, DEBOUNCE_MS, DEFAULT_BACKGROUND,
-    DEFAULT_DPI, DEFAULT_FONT_SIZE_PT, DPI_CHOICES, EDITOR_ROWS, FONT_SIZE_RANGE,
-    HINT_COPY_MARKDOWN, HINT_COPY_OFFICE, HINT_EXIT_POLICY, MSG_CANCELLED, MSG_CONFIG_SAVED,
-    MSG_COPY_OK, MSG_DOCX_OMML_FAILED, MSG_EMPTY_SOURCE, MSG_EXIT_UNSAVED, MSG_EXPORT_OK,
-    MSG_EXTENDED, MSG_IMPORT_OK, MSG_MATHML_UNAVAILABLE, MSG_MD_COPY_OK, MSG_MD_EXPORT_OK,
-    MSG_OMML_UNAVAILABLE, MSG_PLAIN_ONLY, MSG_READY, MSG_UI_FONT_MISSING, MSG_UNSUPPORTED,
-    SOURCE_PANEL_FRACTION, TEXT_EDIT_MARGIN_Y,
+    DEFAULT_DPI, DEFAULT_FONT_SIZE_PT, DIALOG_ACTIONS_GAP, DIALOG_TEXT_SLACK, DPI_CHOICES,
+    EDITOR_ROWS, FONT_SIZE_RANGE, HINT_COPY_MARKDOWN, HINT_COPY_OFFICE, HINT_EXIT_POLICY,
+    MSG_CANCELLED, MSG_CONFIG_SAVED, MSG_COPY_OK, MSG_DOCX_OMML_FAILED, MSG_EMPTY_SOURCE,
+    MSG_EXIT_UNSAVED, MSG_EXPORT_OK, MSG_EXTENDED, MSG_IMPORT_OK, MSG_MATHML_UNAVAILABLE,
+    MSG_MD_COPY_OK, MSG_MD_EXPORT_OK, MSG_OMML_UNAVAILABLE, MSG_PLAIN_ONLY, MSG_READY,
+    MSG_UI_FONT_MISSING, MSG_UNSUPPORTED, SOURCE_PANEL_FRACTION, TEXT_EDIT_MARGIN_Y,
 };
 use crate::render::Renderer;
 
@@ -54,6 +54,11 @@ pub struct RMathTexApp {
     show_exit_confirm: bool,
     /// Set once the prompt was accepted, so the pending close is not cancelled.
     exit_confirmed: bool,
+    /// Whether an IME candidate window is composing into the source editor.
+    ///
+    /// egui stores the raw preedit (pinyin) in the bound string, so the preview
+    /// must not refresh until the candidate is committed.
+    ime_composing: bool,
 }
 
 impl RMathTexApp {
@@ -100,6 +105,7 @@ impl RMathTexApp {
             copied_since_edit: false,
             show_exit_confirm: false,
             exit_confirmed: false,
+            ime_composing: false,
         })
     }
 
@@ -107,6 +113,22 @@ impl RMathTexApp {
     fn display(&self) -> bool {
         self.display_override
             .unwrap_or_else(|| self.normalized.style_hint.unwrap_or(false))
+    }
+
+    /// Applies the effective theme to the whole UI.
+    ///
+    /// `System` resolves against the Windows light/dark preference reported by
+    /// eframe; forcing a theme keeps working even when Windows reports the
+    /// opposite mode, because the visuals are re-derived every frame.
+    fn sync_theme(&self, ctx: &egui::Context, system_theme: Option<eframe::Theme>) {
+        let desired = match self.theme {
+            ThemeChoice::System => system_theme.unwrap_or(eframe::Theme::Light).egui_visuals(),
+            ThemeChoice::Light => egui::Visuals::light(),
+            ThemeChoice::Dark => egui::Visuals::dark(),
+        };
+        if ctx.style().visuals.dark_mode != desired.dark_mode {
+            ctx.set_visuals(desired);
+        }
     }
 
     fn render_key(&self, ctx: &egui::Context) -> RenderKey {
@@ -154,6 +176,27 @@ impl RMathTexApp {
         } else {
             Notice::info(MSG_READY)
         };
+    }
+
+    /// Tracks the IME composition state of the source editor.
+    ///
+    /// egui inserts the preedit (pinyin) directly into the bound string and keeps
+    /// it there while the candidate window is paused, so the state must persist
+    /// across frames instead of looking only at the current input events.
+    fn track_ime_state(&mut self, ctx: &egui::Context) {
+        ctx.input(|input| {
+            for event in &input.events {
+                match event {
+                    egui::Event::Ime(egui::ImeEvent::Preedit(text)) => {
+                        self.ime_composing = !text.is_empty();
+                    }
+                    egui::Event::Ime(egui::ImeEvent::Commit(_) | egui::ImeEvent::Disabled) => {
+                        self.ime_composing = false
+                    }
+                    _ => {}
+                }
+            }
+        });
     }
 
     fn precheck(&self) -> Option<AppError> {
@@ -216,19 +259,33 @@ impl RMathTexApp {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
+                // Auto-sized windows grow every frame when a right-to-left row
+                // fills them, so pin the width to the text instead.
+                ui.set_width(exit_dialog_width(ui));
                 ui.label(MSG_EXIT_UNSAVED);
                 ui.label(RichText::new(HINT_EXIT_POLICY).small().weak());
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("继续编辑").clicked() {
-                        self.show_exit_confirm = false;
-                    }
-                    if ui.button("仍然退出").clicked() {
-                        self.show_exit_confirm = false;
-                        self.exit_confirmed = true;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                });
+                ui.add_space(DIALOG_ACTIONS_GAP);
+                // Standard confirmation layout: actions right aligned, the
+                // primary action rightmost, the safer one next to it.
+                //
+                // The row height must be bounded explicitly: an unbounded
+                // right-to-left layout inside an auto-sized window claims the
+                // whole remaining height and turns the prompt into a tall box.
+                let row = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+                ui.allocate_ui_with_layout(
+                    row,
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        if ui.button("仍然退出").clicked() {
+                            self.show_exit_confirm = false;
+                            self.exit_confirmed = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        if ui.button("继续编辑").clicked() {
+                            self.show_exit_confirm = false;
+                        }
+                    },
+                );
             });
     }
 
@@ -506,12 +563,12 @@ impl RMathTexApp {
         ui.menu_button("主题", |ui| {
             for (value, label) in [
                 (ThemeChoice::System, "跟随系统"),
-                (ThemeChoice::Light, "亮"),
-                (ThemeChoice::Dark, "暗"),
+                (ThemeChoice::Light, "浅色"),
+                (ThemeChoice::Dark, "深色"),
             ] {
                 if ui.radio(self.theme == value, label).clicked() {
                     self.theme = value;
-                    apply_theme(ctx, value);
+                    apply_window_theme(ctx, value);
                     ui.close_menu();
                 }
             }
@@ -543,14 +600,7 @@ impl RMathTexApp {
                 self.markdown_flavor = None;
                 ui.close_menu();
             }
-            for delimiter in [
-                Delimiter::None,
-                Delimiter::Inline,
-                Delimiter::Display,
-                Delimiter::MacroInline,
-                Delimiter::MacroDisplay,
-                Delimiter::Fenced,
-            ] {
+            for delimiter in [Delimiter::Inline, Delimiter::Display, Delimiter::Fenced] {
                 if ui
                     .radio(
                         self.markdown_flavor == Some(delimiter),
@@ -856,13 +906,18 @@ impl RMathTexApp {
                         .desired_rows(rows.max(EDITOR_ROWS))
                         .desired_width(f32::INFINITY),
                 );
-                if response.changed() {
+                if response.changed() && !self.ime_composing {
                     self.on_source_changed();
                 }
             });
     }
 
     fn preview(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        // A refresh postponed during IME composition must still happen once the
+        // candidate is committed, because that commit does not fire `changed()`.
+        if !self.ime_composing && self.source != self.normalized.raw {
+            self.on_source_changed();
+        }
         if self.normalized.body.is_empty()
             || model::validate_source(&self.normalized.body).is_some()
         {
@@ -894,7 +949,9 @@ impl RMathTexApp {
                 if let Some(cached) = &self.cache {
                     let size = cached.rect.size().max(egui::vec2(0.0, 0.0));
                     ui.allocate_exact_size(size, Sense::hover());
-                    ui.painter().add(egui::Shape::Vec(cached.shapes.clone()));
+                    let painter = ui.painter();
+                    painter.add(egui::Shape::Vec(cached.shapes.clone()));
+                    paint_fallback_glyphs(painter, cached);
                 }
             });
     }
@@ -916,7 +973,9 @@ impl RMathTexApp {
 }
 
 impl eframe::App for RMathTexApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.sync_theme(ctx, frame.info().system_theme);
+        self.track_ime_state(ctx);
         self.capture_window(ctx);
         self.intercept_close(ctx);
         self.handle_shortcuts(ctx);
@@ -942,6 +1001,54 @@ impl eframe::App for RMathTexApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.persist_on_exit();
+    }
+}
+
+/// Width of the exit confirmation, measured so the dialog is exactly as wide as
+/// its longer text line instead of the runaway width of a right-to-left row.
+fn exit_dialog_width(ui: &egui::Ui) -> f32 {
+    let message_font = egui::TextStyle::Body.resolve(ui.style());
+    let hint_font = egui::TextStyle::Small.resolve(ui.style());
+    ui.fonts(|fonts| {
+        let message = fonts
+            .layout_no_wrap(
+                MSG_EXIT_UNSAVED.to_owned(),
+                message_font,
+                egui::Color32::PLACEHOLDER,
+            )
+            .size()
+            .x;
+        let hint = fonts
+            .layout_no_wrap(
+                HINT_EXIT_POLICY.to_owned(),
+                hint_font,
+                egui::Color32::PLACEHOLDER,
+            )
+            .size()
+            .x;
+        message.max(hint) + DIALOG_TEXT_SLACK
+    })
+}
+
+/// Paints characters the math face lacks with the UI font.
+///
+/// The math layout reserved a same-width placeholder for each label, so the
+/// glyph only has to be centred on its recorded ink centre.
+fn paint_fallback_glyphs(painter: &egui::Painter, rendered: &Rendered) {
+    let [red, green, blue] = rendered.key.color;
+    let color = egui::Color32::from_rgb(red, green, blue);
+    for label in &rendered.labels {
+        let font = egui::FontId::proportional(label.size);
+        let galley = painter.layout_no_wrap(label.text.to_string(), font, color);
+        let ink = galley.mesh_bounds.center();
+        // An inkless fallback (zero-width or combining mark) has no bounds to
+        // align on, so fall back to the galley box.
+        let offset = if ink.is_finite() {
+            ink.to_vec2()
+        } else {
+            galley.size() * 0.5
+        };
+        painter.galley(label.center - offset, galley, color);
     }
 }
 
@@ -989,7 +1096,12 @@ fn push_first_readable(
     true
 }
 
-fn apply_theme(ctx: &egui::Context, theme: ThemeChoice) {
+/// Applies the selected theme to the window frame only.
+///
+/// `ViewportCommand::SetTheme` recolours the native title bar; egui visuals are
+/// set separately by [`RMathTexApp::sync_theme`], because the command alone
+/// leaves the client area unstyled.
+fn apply_window_theme(ctx: &egui::Context, theme: ThemeChoice) {
     let system = match theme {
         ThemeChoice::System => egui::SystemTheme::SystemDefault,
         ThemeChoice::Light => egui::SystemTheme::Light,

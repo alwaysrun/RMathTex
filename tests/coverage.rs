@@ -257,17 +257,18 @@ fn markdown_delimiter_cases() {
             style_hint: Some(true),
             warning: false,
         },
+        // Macro delimiters are accepted but normalize to the two dollar forms.
         Case {
             input: "\\(a+b\\)",
             body: "a+b",
-            delimiter: Delimiter::MacroInline,
+            delimiter: Delimiter::Inline,
             style_hint: Some(false),
             warning: false,
         },
         Case {
             input: "\\[\\int_0^1 x\\,dx\\]",
             body: "\\int_0^1 x\\,dx",
-            delimiter: Delimiter::MacroDisplay,
+            delimiter: Delimiter::Display,
             style_hint: Some(true),
             warning: false,
         },
