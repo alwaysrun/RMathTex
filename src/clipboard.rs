@@ -3,13 +3,17 @@
 use clipboard_win::{raw, Clipboard};
 
 use crate::convert;
+use crate::linearmath;
 use crate::model::{
     normalize_source, AppError, CF_HTML_FORMAT_NAME, CF_UNICODETEXT, CLIPBOARD_ATTEMPTS,
     MATHML_FORMAT_NAMES, MSG_CLIPBOARD_BUSY, MSG_NO_FORMULA,
 };
 
-/// Writes MathML, CF_HTML(OMML) and plain LaTeX in one clipboard transaction.
+/// Writes MathML, CF_HTML and plain LaTeX in one clipboard transaction.
 ///
+/// Word ignores raw OMML inside `HTML Format` but converts a MathML fragment
+/// into a native equation, so the HTML payload carries MathML whenever it is
+/// available; OMML is only a fallback for hosts without a MathML parser.
 /// Every format is attempted even when an earlier one fails, because Office
 /// negotiates whichever format it prefers. Returns the formats actually stored.
 pub fn write_office(
@@ -29,9 +33,12 @@ pub fn write_office(
             }
         }
     }
-    if let Some(omml) = omml {
+    let fragment = mathml
+        .map(str::to_owned)
+        .or_else(|| omml.map(wrap_omml_paragraph));
+    if let Some(fragment) = fragment {
         if let Ok(format) = format_code(CF_HTML_FORMAT_NAME) {
-            let html = cf_html(&wrap_omml_paragraph(omml));
+            let html = cf_html(&fragment);
             if raw::set_without_clear(format.get(), &html).is_ok() {
                 written.push(CF_HTML_FORMAT_NAME);
             }
@@ -51,33 +58,57 @@ pub fn write_text(text: &str) -> Result<(), AppError> {
         .map_err(|error| AppError::caused("E403", "纯文本写入失败", error))
 }
 
-/// Reads a formula copied from Word: CF_HTML/OMML first, plain text last.
+/// Reads a formula copied from Word: aligned arrays from the linear text,
+/// other shapes from CF_HTML/OMML, then linear text or plain LaTeX.
 pub fn read_office() -> Result<String, AppError> {
     let _clipboard = open()?;
-    if let Ok(format) = format_code(CF_HTML_FORMAT_NAME) {
-        if raw::is_format_avail(format.get()) {
-            let mut buffer = Vec::new();
-            if raw::get_vec(format.get(), &mut buffer).is_ok() {
-                if let Some(omml) = extract_omml(&buffer) {
-                    if let Some(latex) = omml_subtree_to_latex(&omml) {
-                        return Ok(normalize_source(&latex).body);
-                    }
-                }
+    let text = read_unicode_text();
+    // OMML loses the `&` alignment points of an equation array; its linear
+    // text keeps them, so the linear form restores the original layout better.
+    if let Some(text) = &text {
+        if linearmath::has_equation_array(text) {
+            if let Some(latex) = linearmath::to_latex(text) {
+                return Ok(normalize_source(&latex).body);
             }
         }
     }
-    if has_mathml() {
-        return Err(AppError::new("E405", MSG_NO_FORMULA));
+    if let Some(latex) = read_omml_latex() {
+        return Ok(normalize_source(&latex).body);
     }
-    let mut buffer = Vec::new();
-    if raw::is_format_avail(CF_UNICODETEXT) && raw::get_vec(CF_UNICODETEXT, &mut buffer).is_ok() {
-        let text = utf16_bytes_to_string(&buffer);
-        let trimmed = text.trim_matches(|c: char| c.is_whitespace() || c == '\0');
-        if !trimmed.is_empty() && (trimmed.contains('\\') || trimmed.contains('$')) {
-            return Ok(normalize_source(trimmed).body);
+    if let Some(text) = &text {
+        if let Some(latex) = linearmath::to_latex(text) {
+            return Ok(normalize_source(&latex).body);
+        }
+        if text.contains('\\') || text.contains('$') {
+            return Ok(normalize_source(text).body);
         }
     }
     Err(AppError::new("E405", MSG_NO_FORMULA))
+}
+
+/// L1: extracts OMML from `HTML Format` and converts the subtree back to LaTeX.
+fn read_omml_latex() -> Option<String> {
+    let format = format_code(CF_HTML_FORMAT_NAME).ok()?;
+    if !raw::is_format_avail(format.get()) {
+        return None;
+    }
+    let mut buffer = Vec::new();
+    raw::get_vec(format.get(), &mut buffer).ok()?;
+    let omml = extract_omml(&buffer)?;
+    omml_subtree_to_latex(&omml)
+}
+
+/// L2/L3: returns the trimmed UTF-16 text, unless it is empty.
+fn read_unicode_text() -> Option<String> {
+    if !raw::is_format_avail(CF_UNICODETEXT) {
+        return None;
+    }
+    let mut buffer = Vec::new();
+    raw::get_vec(CF_UNICODETEXT, &mut buffer).ok()?;
+    let text = utf16_bytes_to_string(&buffer);
+    let trimmed =
+        text.trim_matches(|character: char| character.is_whitespace() || character == '\0');
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
 /// Builds a CF_HTML payload with byte-accurate, zero-padded offsets.
@@ -137,12 +168,6 @@ fn open() -> Result<Clipboard, AppError> {
 fn format_code(name: &str) -> Result<std::num::NonZeroU32, AppError> {
     raw::register_format(name)
         .ok_or_else(|| AppError::new("E402", format!("剪贴板格式注册失败：{name}")))
-}
-
-fn has_mathml() -> bool {
-    MATHML_FORMAT_NAMES
-        .iter()
-        .any(|name| format_code(name).is_ok_and(|format| raw::is_format_avail(format.get())))
 }
 
 fn wrap_omml_paragraph(omml: &str) -> String {

@@ -19,9 +19,11 @@ Cargo.lock
 
 # ---------------------------------------------------------------------------
 # Runtime data: the app writes logs to ./logs relative to the working directory
+# and favorites to RMathTex.json next to the executable
 # ---------------------------------------------------------------------------
 logs/
 *.log
+RMathTex.json
 
 # ---------------------------------------------------------------------------
 # Python helper scripts

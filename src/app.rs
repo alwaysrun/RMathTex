@@ -2,23 +2,28 @@
 
 use std::time::{Duration, Instant};
 
+use eframe::egui::text::{CCursor, CCursorRange};
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, RichText, Sense};
 
+use crate::catalog;
 use crate::clipboard;
+use crate::config;
 use crate::convert;
 use crate::export;
+use crate::linearmath;
 use crate::model::{
     self, to_markdown, AppError, CoverageLevel, Delimiter, ExportStyle, ExportTarget, Level,
     NormalizedSource, Notice, PngBackgroundChoice, RenderKey, Rendered, ThemeChoice,
     AUTO_FLAVOR_FALLBACK, DEBOUNCE_MS, DEFAULT_BACKGROUND, DEFAULT_DPI, DEFAULT_FONT_SIZE_PT,
-    DPI_CHOICES, EDITOR_ROWS, FONT_SIZE_RANGE, MSG_CANCELLED, MSG_COPY_OK, MSG_DOCX_OMML_FAILED,
-    MSG_EMPTY_SOURCE, MSG_EXPORT_OK, MSG_EXTENDED, MSG_IMPORT_OK, MSG_MATHML_UNAVAILABLE,
-    MSG_MD_COPY_OK, MSG_MD_EXPORT_OK, MSG_OMML_UNAVAILABLE, MSG_PLAIN_ONLY, MSG_READY,
-    MSG_UI_FONT_MISSING, MSG_UNSUPPORTED,
+    DPI_CHOICES, EDITOR_ROWS, FONT_SIZE_RANGE, HINT_COPY_MARKDOWN, HINT_COPY_OFFICE, MSG_CANCELLED,
+    MSG_CONFIG_SAVED, MSG_COPY_OK, MSG_DOCX_OMML_FAILED, MSG_EMPTY_SOURCE, MSG_EXPORT_OK,
+    MSG_EXTENDED, MSG_IMPORT_OK, MSG_MATHML_UNAVAILABLE, MSG_MD_COPY_OK, MSG_MD_EXPORT_OK,
+    MSG_OMML_UNAVAILABLE, MSG_PLAIN_ONLY, MSG_READY, MSG_UI_FONT_MISSING, MSG_UNSUPPORTED,
+    SOURCE_PANEL_FRACTION, TEXT_EDIT_MARGIN_Y,
 };
 use crate::render::Renderer;
 
-/// All in-memory state of the editor; nothing is persisted.
+/// All in-memory state of the editor; only the favorites list is persisted.
 pub struct RMathTexApp {
     source: String,
     normalized: NormalizedSource,
@@ -31,6 +36,8 @@ pub struct RMathTexApp {
     dpi: i64,
     png_background: PngBackgroundChoice,
     markdown_flavor: Option<Delimiter>,
+    favorites: Vec<String>,
+    show_favorites_manager: bool,
     notice: Notice,
 }
 
@@ -38,10 +45,19 @@ impl RMathTexApp {
     /// Builds the app; the embedded math font is the only fallible startup step.
     pub fn new(creation: &eframe::CreationContext<'_>) -> Result<Self, AppError> {
         let renderer = Renderer::new()?;
-        let notice = if install_ui_font(&creation.egui_ctx) {
-            Notice::info(MSG_READY)
-        } else {
-            Notice::warn("E501", MSG_UI_FONT_MISSING)
+        let (favorites, config_error) = match config::load() {
+            Ok(config) => (config.favorites, None),
+            Err(error) => (catalog::default_favorites(), Some(error)),
+        };
+        let font_ready = install_ui_font(&creation.egui_ctx);
+        let notice = match (config_error, font_ready) {
+            (Some(error), false) => Notice::warn(
+                error.code,
+                format!("{}；{}", error.message, MSG_UI_FONT_MISSING),
+            ),
+            (Some(error), true) => Notice::warn(error.code, error.message),
+            (None, false) => Notice::warn("E501", MSG_UI_FONT_MISSING),
+            (None, true) => Notice::info(MSG_READY),
         };
         Ok(Self {
             source: String::new(),
@@ -55,6 +71,8 @@ impl RMathTexApp {
             dpi: DEFAULT_DPI,
             png_background: DEFAULT_BACKGROUND,
             markdown_flavor: None,
+            favorites,
+            show_favorites_manager: false,
             notice,
         })
     }
@@ -273,9 +291,23 @@ impl RMathTexApp {
         });
         if copy {
             self.copy_office();
+            // Ctrl+Shift+C also reaches egui-winit as `Event::Copy`; the focused
+            // editor would replace the Office formats with plain text.
+            ctx.input_mut(|input| {
+                input
+                    .events
+                    .retain(|event| !matches!(event, egui::Event::Copy))
+            });
         }
         if paste {
             self.import_office();
+            // Ctrl+Shift+V also reaches egui-winit as `Event::Paste`; the raw
+            // UnicodeMath text would overwrite the imported formula.
+            ctx.input_mut(|input| {
+                input
+                    .events
+                    .retain(|event| !matches!(event, egui::Event::Paste(_)));
+            });
         }
         if markdown {
             self.copy_markdown();
@@ -284,107 +316,378 @@ impl RMathTexApp {
 
     // --------------------------------------------------------------------- UI
 
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(2.0);
-        ui.horizontal(|ui| {
-            ui.label("字号");
+    fn menu_bar(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        egui::menu::bar(ui, |ui| {
+            ui.menu_button("文件", |ui| {
+                for target in [
+                    ExportTarget::Svg,
+                    ExportTarget::Png,
+                    ExportTarget::Docx,
+                    ExportTarget::Markdown,
+                ] {
+                    if ui
+                        .button(format!("导出 {}", export::target_label(target)))
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        self.export_target(target);
+                    }
+                }
+                ui.separator();
+                if ui.button("退出").clicked() {
+                    ui.close_menu();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+            ui.menu_button("编辑", |ui| {
+                if ui
+                    .add(egui::Button::new("复制到 Office").shortcut_text("Ctrl+Shift+C"))
+                    .clicked()
+                {
+                    ui.close_menu();
+                    self.copy_office();
+                }
+                if ui
+                    .add(egui::Button::new("从 Office 导入").shortcut_text("Ctrl+Shift+V"))
+                    .clicked()
+                {
+                    ui.close_menu();
+                    self.import_office();
+                }
+                if ui
+                    .add(egui::Button::new("复制为 Markdown").shortcut_text("Ctrl+Shift+M"))
+                    .clicked()
+                {
+                    ui.close_menu();
+                    self.copy_markdown();
+                }
+            });
+            ui.menu_button("公式", |ui| self.formula_menu(ctx, ui));
+            ui.menu_button("设置", |ui| self.settings_menu(ctx, ui));
+            ui.menu_button("常用公式", |ui| {
+                if ui.button("管理常用公式…").clicked() {
+                    ui.close_menu();
+                    self.show_favorites_manager = true;
+                }
+                ui.separator();
+                if ui.button("恢复默认").clicked() {
+                    ui.close_menu();
+                    self.reset_favorites();
+                }
+            });
+        });
+    }
+
+    fn formula_menu(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        for category in catalog::FORMULA_CATEGORIES {
+            ui.menu_button(category.name, |ui| {
+                for entry in category.entries {
+                    let text = format!("{}   {}", entry.label, entry.latex);
+                    if ui.button(text).clicked() {
+                        ui.close_menu();
+                        self.insert_snippet(ctx, entry.latex);
+                    }
+                }
+            });
+        }
+    }
+
+    fn settings_menu(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        ui.menu_button("字号", |ui| {
             ui.add(egui::Slider::new(&mut self.font_size_pt, FONT_SIZE_RANGE).suffix(" pt"));
-            ui.separator();
-            ui.label("排版");
+        });
+        ui.menu_button("排版", |ui| {
             let display = self.display();
             if ui.radio(display, "Display").clicked() {
                 self.display_override = Some(true);
+                ui.close_menu();
             }
             if ui.radio(!display, "Text").clicked() {
                 self.display_override = Some(false);
+                ui.close_menu();
             }
-            ui.separator();
-            ui.label("主题");
-            let mut theme = self.theme;
-            ui.radio_value(&mut theme, ThemeChoice::System, "跟随系统");
-            ui.radio_value(&mut theme, ThemeChoice::Light, "亮");
-            ui.radio_value(&mut theme, ThemeChoice::Dark, "暗");
-            if theme != self.theme {
-                self.theme = theme;
-                apply_theme(ui.ctx(), theme);
-            }
-            ui.separator();
-            ui.label("PNG 背景");
-            ui.radio_value(
-                &mut self.png_background,
-                PngBackgroundChoice::Transparent,
-                "透明",
-            );
-            ui.radio_value(&mut self.png_background, PngBackgroundChoice::White, "白底");
         });
-        ui.horizontal(|ui| {
-            ui.label("DPI");
-            egui::ComboBox::from_id_source("dpi")
-                .selected_text(self.dpi.to_string())
-                .show_ui(ui, |ui| {
-                    for dpi in DPI_CHOICES {
-                        ui.selectable_value(&mut self.dpi, dpi, dpi.to_string());
-                    }
-                });
-            ui.separator();
-            ui.label("Markdown 形态");
-            egui::ComboBox::from_id_source("flavor")
-                .selected_text(flavor_label(self.markdown_flavor))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.markdown_flavor, None, "跟随输入");
-                    for delimiter in [
-                        Delimiter::None,
-                        Delimiter::Inline,
-                        Delimiter::Display,
-                        Delimiter::MacroInline,
-                        Delimiter::MacroDisplay,
-                        Delimiter::Fenced,
-                    ] {
-                        ui.selectable_value(
-                            &mut self.markdown_flavor,
-                            Some(delimiter),
-                            delimiter.flavor_name(),
-                        );
-                    }
-                });
-            ui.label(RichText::new("（行内形态适合单行公式）").small().weak());
-        });
-        ui.horizontal(|ui| {
-            if ui.button("复制到 Office").clicked() {
-                self.copy_office();
-            }
-            if ui.button("从 Office 导入").clicked() {
-                self.import_office();
-            }
-            if ui.button("复制为 Markdown").clicked() {
-                self.copy_markdown();
-            }
-            ui.separator();
-            for target in [
-                ExportTarget::Svg,
-                ExportTarget::Png,
-                ExportTarget::Docx,
-                ExportTarget::Markdown,
+        ui.menu_button("主题", |ui| {
+            for (value, label) in [
+                (ThemeChoice::System, "跟随系统"),
+                (ThemeChoice::Light, "亮"),
+                (ThemeChoice::Dark, "暗"),
             ] {
-                let label = format!("导出 {}", export::target_label(target));
-                if ui.button(label).clicked() {
-                    self.export_target(target);
+                if ui.radio(self.theme == value, label).clicked() {
+                    self.theme = value;
+                    apply_theme(ctx, value);
+                    ui.close_menu();
                 }
             }
         });
-        ui.add_space(2.0);
+        ui.menu_button("PNG 背景", |ui| {
+            for (value, label) in [
+                (PngBackgroundChoice::Transparent, "透明"),
+                (PngBackgroundChoice::White, "白底"),
+            ] {
+                if ui.radio(self.png_background == value, label).clicked() {
+                    self.png_background = value;
+                    ui.close_menu();
+                }
+            }
+        });
+        ui.menu_button("PNG DPI", |ui| {
+            for dpi in DPI_CHOICES {
+                if ui.radio(self.dpi == dpi, dpi.to_string()).clicked() {
+                    self.dpi = dpi;
+                    ui.close_menu();
+                }
+            }
+        });
+        ui.menu_button("Markdown 形态", |ui| {
+            if ui
+                .radio(self.markdown_flavor.is_none(), "跟随输入")
+                .clicked()
+            {
+                self.markdown_flavor = None;
+                ui.close_menu();
+            }
+            for delimiter in [
+                Delimiter::None,
+                Delimiter::Inline,
+                Delimiter::Display,
+                Delimiter::MacroInline,
+                Delimiter::MacroDisplay,
+                Delimiter::Fenced,
+            ] {
+                if ui
+                    .radio(
+                        self.markdown_flavor == Some(delimiter),
+                        delimiter.flavor_name(),
+                    )
+                    .clicked()
+                {
+                    self.markdown_flavor = Some(delimiter);
+                    ui.close_menu();
+                }
+            }
+            ui.label(RichText::new("行内形态适合单行公式").small().weak());
+        });
     }
 
-    fn editor(&mut self, ui: &mut egui::Ui, height: f32) {
+    fn toolbar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .button("复制为Office")
+                .on_hover_text(HINT_COPY_OFFICE)
+                .clicked()
+            {
+                self.copy_office();
+            }
+            if ui
+                .button("复制为MD")
+                .on_hover_text(HINT_COPY_MARKDOWN)
+                .clicked()
+            {
+                self.copy_markdown();
+            }
+            ui.separator();
+            ui.label("字母");
+            let mut selected = None;
+            for entry in catalog::greek_palette() {
+                if ui.button(entry.label).on_hover_text(entry.latex).clicked() {
+                    selected = Some(entry.latex);
+                }
+            }
+            if let Some(latex) = selected {
+                self.insert_snippet(ui.ctx(), latex);
+            }
+        });
+    }
+
+    fn favorites_bar(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("公式");
+            let mut selected = None;
+            let mut shown = 0_usize;
+            for id in &self.favorites {
+                let Some(entry) = catalog::find(id) else {
+                    continue;
+                };
+                // Greek letters are offered on the first toolbar row already.
+                if catalog::is_greek(entry.id) {
+                    continue;
+                }
+                shown += 1;
+                if ui.button(entry.label).on_hover_text(entry.latex).clicked() {
+                    selected = Some(entry.latex);
+                }
+            }
+            if shown == 0 {
+                ui.label(
+                    RichText::new("未设定，可在「常用公式」菜单中添加")
+                        .small()
+                        .weak(),
+                );
+            }
+            ui.separator();
+            if ui.button("设定…").clicked() {
+                self.show_favorites_manager = true;
+            }
+            if let Some(latex) = selected {
+                self.insert_snippet(ctx, latex);
+            }
+        });
+    }
+
+    fn favorites_manager(&mut self, ctx: &egui::Context) {
+        if !self.show_favorites_manager {
+            return;
+        }
+        let mut open = self.show_favorites_manager;
+        egui::Window::new("常用公式设定")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.label("勾选需要显示在工具栏上的公式。");
+                ui.label(
+                    RichText::new("希腊字母固定显示在工具栏第一行，不在此处设定")
+                        .small()
+                        .weak(),
+                );
+                egui::ScrollArea::vertical()
+                    .max_height(360.0)
+                    .show(ui, |ui| {
+                        for category in catalog::FORMULA_CATEGORIES {
+                            if category.name == catalog::GREEK_CATEGORY_NAME {
+                                continue;
+                            }
+                            egui::CollapsingHeader::new(category.name).show(ui, |ui| {
+                                for entry in category.entries {
+                                    let mut checked =
+                                        self.favorites.iter().any(|id| id == entry.id);
+                                    if ui
+                                        .checkbox(
+                                            &mut checked,
+                                            format!("{}   {}", entry.label, entry.latex),
+                                        )
+                                        .changed()
+                                    {
+                                        self.set_favorite(entry.id, checked);
+                                        self.persist_favorites();
+                                    }
+                                }
+                            });
+                        }
+                    });
+                if ui.button("恢复默认").clicked() {
+                    self.reset_favorites();
+                }
+            });
+        self.show_favorites_manager = open;
+    }
+
+    fn set_favorite(&mut self, id: &'static str, enabled: bool) {
+        if enabled {
+            if !self.favorites.iter().any(|favorite| favorite == id) {
+                self.favorites.push(id.to_owned());
+            }
+        } else {
+            self.favorites.retain(|favorite| favorite != id);
+        }
+        self.favorites = catalog::sanitize(&self.favorites);
+    }
+
+    fn reset_favorites(&mut self) {
+        self.favorites = catalog::default_favorites();
+        self.persist_favorites();
+    }
+
+    fn persist_favorites(&mut self) {
+        match config::save(&self.favorites) {
+            Ok(path) => {
+                let path = path.display().to_string();
+                self.notice = Notice::info(fill(MSG_CONFIG_SAVED, &[("path", &path)]));
+            }
+            Err(error) => self.fail(error),
+        }
+    }
+
+    /// Replaces the editor selection with `snippet`, then moves the caret past it.
+    fn insert_snippet(&mut self, ctx: &egui::Context, snippet: &str) {
+        let id = Self::editor_id();
+        let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+        let (start, end) = match state.cursor.char_range() {
+            Some(range) => (
+                range.primary.index.min(range.secondary.index),
+                range.primary.index.max(range.secondary.index),
+            ),
+            None => {
+                let end = self.source.chars().count();
+                (end, end)
+            }
+        };
+        let start_byte = char_to_byte(&self.source, start);
+        let end_byte = char_to_byte(&self.source, end);
+        self.source.replace_range(start_byte..end_byte, snippet);
+        let cursor = start + snippet.chars().count();
+        state
+            .cursor
+            .set_char_range(Some(CCursorRange::one(CCursor::new(cursor))));
+        state.store(ctx, id);
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        self.on_source_changed();
+    }
+
+    fn editor_id() -> egui::Id {
+        egui::Id::new("latex_source_editor")
+    }
+
+    /// Turns a Ctrl+V paste of Word linear math into LaTeX.
+    ///
+    /// The paste event is consumed here, before `TextEdit` sees it, because the
+    /// widget would otherwise insert the raw `█(a&=b+c@&=d+e)` text. Any other
+    /// paste stays untouched for the standard editing path.
+    fn absorb_linear_paste(&mut self, ctx: &egui::Context) {
+        let id = Self::editor_id();
+        if !ctx.memory(|memory| memory.has_focus(id)) {
+            return;
+        }
+        let mut converted = None;
+        ctx.input_mut(|input| {
+            let mut kept = Vec::with_capacity(input.events.len());
+            for event in std::mem::take(&mut input.events) {
+                match &event {
+                    egui::Event::Paste(text) if converted.is_none() => {
+                        match linearmath::to_latex(text) {
+                            Some(latex) => converted = Some(latex),
+                            None => kept.push(event),
+                        }
+                    }
+                    _ => kept.push(event),
+                }
+            }
+            input.events = kept;
+        });
+        if let Some(latex) = converted {
+            self.insert_snippet(ctx, &latex);
+        }
+    }
+
+    fn editor(&mut self, ui: &mut egui::Ui) {
         ui.label("LaTeX 源码");
+        self.absorb_linear_paste(ui.ctx());
         egui::ScrollArea::vertical()
             .id_source("source_editor")
-            .max_height(height)
+            .auto_shrink([false, false])
             .show(ui, |ui| {
+                // `desired_rows` is the only knob that stretches a multiline
+                // TextEdit, so derive it from the panel height instead of
+                // leaving the lower half of the panel empty.
+                let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+                let usable = (ui.available_height() - TEXT_EDIT_MARGIN_Y).max(0.0);
+                let rows = (usable / row_height).floor() as usize;
                 let response = ui.add(
                     egui::TextEdit::multiline(&mut self.source)
+                        .id(Self::editor_id())
                         .code_editor()
-                        .desired_rows(EDITOR_ROWS)
+                        .desired_rows(rows.max(EDITOR_ROWS))
                         .desired_width(f32::INFINITY),
                 );
                 if response.changed() {
@@ -394,8 +697,6 @@ impl RMathTexApp {
     }
 
     fn preview(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
-        ui.label("预览");
-        ui.separator();
         if self.normalized.body.is_empty()
             || model::validate_source(&self.normalized.body).is_some()
         {
@@ -451,41 +752,67 @@ impl RMathTexApp {
 impl eframe::App for RMathTexApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_shortcuts(ctx);
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.toolbar(ui));
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| self.status_bar(ui));
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let editor_height = (ui.available_height() * 0.4).max(80.0);
-            self.editor(ui, editor_height);
+        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+            self.menu_bar(ctx, ui);
             ui.separator();
-            self.preview(ctx, ui);
+            self.toolbar(ui);
+            ui.separator();
+            self.favorites_bar(ctx, ui);
         });
+        egui::TopBottomPanel::bottom("status").show(ctx, |ui| self.status_bar(ui));
+        // Preview on top, source below: the editor starts at one third of the
+        // workspace and the panel handle rebalances the two areas.
+        let source_height = ctx.available_rect().height() * SOURCE_PANEL_FRACTION;
+        egui::TopBottomPanel::bottom("source")
+            .resizable(true)
+            .default_height(source_height)
+            .show(ctx, |ui| self.editor(ui));
+        egui::CentralPanel::default().show(ctx, |ui| self.preview(ctx, ui));
+        self.favorites_manager(ctx);
     }
 }
 
-/// Registers the first readable Windows CJK font as a fallback of the default families.
+/// Registers Windows CJK and symbol fonts as fallbacks of the default families.
 ///
-/// egui bundles Latin-only fonts, so every Chinese label renders as a tofu box
-/// unless a system font is appended to the family fallback chain. Returns `false`
-/// when no candidate file is readable so the caller can report the degradation.
+/// egui bundles Latin-only fonts, so Chinese labels and mathematical symbols
+/// (`∓`, `∮`, `⟹`, …) render as tofu boxes unless system fonts are appended to
+/// the family fallback chain. Returns `false` when no CJK candidate is readable
+/// so the caller can report the degradation; symbol fonts are optional because
+/// the CJK fonts already cover the common glyphs.
 fn install_ui_font(ctx: &egui::Context) -> bool {
-    let Some((name, bytes)) = model::UI_FONT_CANDIDATES
+    let mut fonts = egui::FontDefinitions::default();
+    let mut fallbacks: Vec<&'static str> = Vec::new();
+    let cjk_ready = push_first_readable(&mut fonts, &model::UI_FONT_CANDIDATES, &mut fallbacks);
+    push_first_readable(
+        &mut fonts,
+        &model::UI_SYMBOL_FONT_CANDIDATES,
+        &mut fallbacks,
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        let chain = fonts.families.entry(family).or_default();
+        chain.extend(fallbacks.iter().map(|&name| name.to_owned()));
+    }
+    ctx.set_fonts(fonts);
+    cjk_ready
+}
+
+/// Loads the first readable candidate into `fonts` and records its name in
+/// `fallbacks`, preserving the candidate order as fallback priority.
+fn push_first_readable(
+    fonts: &mut egui::FontDefinitions,
+    candidates: &[(&'static str, &'static str)],
+    fallbacks: &mut Vec<&'static str>,
+) -> bool {
+    let Some((name, bytes)) = candidates
         .iter()
         .find_map(|(name, path)| std::fs::read(path).ok().map(|bytes| (*name, bytes)))
     else {
         return false;
     };
-    let mut fonts = egui::FontDefinitions::default();
     fonts
         .font_data
         .insert(name.to_owned(), egui::FontData::from_owned(bytes));
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts
-            .families
-            .entry(family)
-            .or_default()
-            .push(name.to_owned());
-    }
-    ctx.set_fonts(fonts);
+    fallbacks.push(name);
     true
 }
 
@@ -505,8 +832,11 @@ fn background_label(background: PngBackgroundChoice) -> &'static str {
     }
 }
 
-fn flavor_label(flavor: Option<Delimiter>) -> &'static str {
-    flavor.map_or("跟随输入", Delimiter::flavor_name)
+/// Converts a character index into a byte offset, clamped to the text length.
+fn char_to_byte(text: &str, index: usize) -> usize {
+    text.char_indices()
+        .nth(index)
+        .map_or(text.len(), |(byte, _)| byte)
 }
 
 fn fill(template: &str, pairs: &[(&str, &str)]) -> String {

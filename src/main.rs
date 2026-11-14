@@ -7,9 +7,12 @@
 compile_error!("RMathTex only supports Windows 10/11 x64; no fallback path exists");
 
 mod app;
+mod catalog;
 mod clipboard;
+mod config;
 mod convert;
 mod export;
+mod linearmath;
 mod model;
 mod render;
 

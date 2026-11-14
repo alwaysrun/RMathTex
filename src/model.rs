@@ -39,6 +39,10 @@ pub const WINDOW_SIZE: [f32; 2] = [960.0, 640.0];
 pub const MIN_WINDOW_SIZE: [f32; 2] = [720.0, 480.0];
 /// Row count of the source editor.
 pub const EDITOR_ROWS: usize = 4;
+/// Vertical margin egui puts around a multiline `TextEdit` (2pt top + 2pt bottom).
+pub const TEXT_EDIT_MARGIN_Y: f32 = 4.0;
+/// Share of the workspace height the source editor occupies by default.
+pub const SOURCE_PANEL_FRACTION: f32 = 1.0 / 3.0;
 /// `CF_UNICODETEXT` clipboard format id.
 pub const CF_UNICODETEXT: u32 = 13;
 /// CF_HTML clipboard format name.
@@ -51,6 +55,10 @@ pub const AUTO_FLAVOR_FALLBACK: Delimiter = Delimiter::Inline;
 pub const MD_FENCE_OPEN: &str = "```math\n";
 /// Closing line of a GitHub math fence.
 pub const MD_FENCE_CLOSE: &str = "\n```";
+/// Configuration file name, stored next to the executable.
+pub const CONFIG_FILE_NAME: &str = "RMathTex.json";
+/// Schema version written to the configuration file.
+pub const CONFIG_VERSION: u32 = 1;
 
 /// Prefix/suffix table of [`to_markdown`]; the six rows are the format contract.
 pub const MD_DELIMITERS: [(Delimiter, &str, &str); 6] = [
@@ -72,6 +80,17 @@ pub const UI_FONT_CANDIDATES: [(&str, &str); 5] = [
     ("SimHei", "C:\\Windows\\Fonts\\simhei.ttf"),
     ("SimSun", "C:\\Windows\\Fonts\\simsun.ttc"),
     ("DengXian", "C:\\Windows\\Fonts\\Deng.ttf"),
+];
+
+/// Windows symbol font candidates for the UI, most preferred first.
+///
+/// The CJK fallbacks above lack several mathematical operators and arrows used
+/// by the formula labels (`∓`, `∮`, `⟹`, `⟶`, …), so a symbol font is appended
+/// to the same fallback chain. Every candidate is a single-face `.ttf` because
+/// egui panics when a font collection index is out of range.
+pub const UI_SYMBOL_FONT_CANDIDATES: [(&str, &str); 2] = [
+    ("Segoe UI Symbol", "C:\\Windows\\Fonts\\seguisym.ttf"),
+    ("Lucida Sans Unicode", "C:\\Windows\\Fonts\\l_10646.ttf"),
 ];
 
 // ---------------------------------------------------------- status messages
@@ -117,6 +136,20 @@ pub const MSG_TOO_DEEP: &str = "公式嵌套过深，请简化结构";
 pub const MSG_DOCX_OMML_FAILED: &str = "docx 所需 OMML 转换失败";
 /// No system CJK font was readable, so UI labels may fall back to tofu boxes.
 pub const MSG_UI_FONT_MISSING: &str = "未找到系统中文字体，界面文字可能显示为方块";
+/// Configuration file could not be read or parsed.
+pub const MSG_CONFIG_LOAD_FAILED: &str = "常用公式配置读取失败，已使用默认配置";
+/// Configuration file could not be written.
+pub const MSG_CONFIG_SAVE_FAILED: &str = "常用公式配置保存失败";
+/// The executable directory is unavailable, so no configuration path exists.
+pub const MSG_CONFIG_PATH_FAILED: &str = "无法定位程序所在目录，常用公式配置不可用";
+/// `{path}` = configuration file path.
+pub const MSG_CONFIG_SAVED: &str = "常用公式配置已保存：{path}";
+/// Toolbar hover text: action name, effect and shortcut of the Office copy button.
+pub const HINT_COPY_OFFICE: &str =
+    "复制为 Office 公式（Ctrl+Shift+C）\n写入 MathML / OMML / HTML，Word / PPT / WPS 中粘贴得可编辑公式";
+/// Toolbar hover text: action name, effect and shortcut of the Markdown copy button.
+pub const HINT_COPY_MARKDOWN: &str =
+    "复制为 Markdown（Ctrl+Shift+M）\n按「设置 → Markdown 形态」包装为纯文本";
 
 // -------------------------------------------------------------------- types
 

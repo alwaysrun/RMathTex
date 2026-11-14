@@ -10,6 +10,8 @@ mod clipboard;
 mod convert;
 #[path = "../src/export.rs"]
 mod export;
+#[path = "../src/linearmath.rs"]
+mod linearmath;
 #[path = "../src/model.rs"]
 mod model;
 #[path = "../src/render.rs"]
@@ -176,6 +178,57 @@ fn markdown_output_three_paths_consistent() {
     assert_eq!(copied, after_import);
     assert_eq!(exported, copied.as_bytes());
     assert_eq!(copied, "$$\n\\frac{a}{b}\n$$");
+}
+
+#[test]
+fn word_linear_equation_array_converts_and_renders() {
+    let latex = linearmath::to_latex("█(a&=b+c@&=d+e)").expect("equation array");
+    assert_eq!(latex, "\\begin{aligned}a&=b+c\\\\&=d+e\\end{aligned}");
+    let renderer = Renderer::new().expect("font");
+    let key = RenderKey::new(&latex, 14, true, 1.0, [0, 0, 0]);
+    renderer
+        .render(&latex, key, egui::Pos2::ZERO)
+        .expect("render imported formula");
+}
+
+#[test]
+fn word_linear_matrix_radical_and_symbols() {
+    assert_eq!(
+        linearmath::to_latex("■(1&2@3&4)").expect("matrix"),
+        "\\begin{pmatrix}1&2\\\\3&4\\end{pmatrix}"
+    );
+    assert_eq!(
+        linearmath::to_latex("█(a=b@c=d)").expect("gather"),
+        "\\begin{gather}a=b\\\\c=d\\end{gather}"
+    );
+    assert_eq!(
+        linearmath::to_latex("α≤β+√(x)+√[3](y)").expect("symbols"),
+        "\\alpha\\le\\beta+\\sqrt{x}+\\sqrt[3]{y}"
+    );
+    assert_eq!(
+        linearmath::to_latex("x_(n+1)^(2)").expect("scripts"),
+        "x_{n+1}^{2}"
+    );
+}
+
+#[test]
+fn latex_and_plain_pastes_are_not_rewritten() {
+    assert!(linearmath::to_latex("\\frac{a}{b}").is_none());
+    assert!(linearmath::to_latex("x^2 + y_1").is_none());
+    assert!(linearmath::to_latex("plain prose").is_none());
+    assert!(linearmath::has_equation_array("█(a&=b@c&=d)"));
+    assert!(!linearmath::has_equation_array("■(a&b@c&d)"));
+}
+
+#[test]
+fn omml_equation_array_reads_back() {
+    let omml = "<m:oMathPara><m:oMath><m:eqArr>\
+                <m:e><m:r><m:t>a</m:t></m:r><m:r><m:t>=</m:t></m:r>\
+                <m:r><m:t>b</m:t></m:r></m:e>\
+                <m:e><m:r><m:t>=</m:t></m:r><m:r><m:t>d</m:t></m:r></m:e>\
+                </m:eqArr></m:oMath></m:oMathPara>";
+    let latex = convert::from_omml(omml).expect("from_omml");
+    assert_eq!(latex, "\\begin{array}{c}a=b\\\\=d\\end{array}");
 }
 
 fn header_field(text: &str, key: &str) -> usize {

@@ -147,13 +147,28 @@ fn push_preview_line<'a>(lines: &mut Vec<&'a str>, line: &'a str) {
     }
 }
 
+fn map_error(error: latex_rust::Error) -> AppError {
+    let code = if matches!(error, latex_rust::Error::Parse(_)) {
+        "E201"
+    } else {
+        "E202"
+    };
+    let message = if code == "E201" {
+        "预览解析失败"
+    } else {
+        "预览布局失败"
+    };
+    AppError::caused(code, message, error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::preview_lines;
 
     #[test]
     fn splits_hard_newlines_only_at_depth_zero() {
-        let source = "a + b\n\\frac{x\n}{y}\n\\begin{pmatrix}\n1 & 2 \\\\\n3 & 4\n\\end{pmatrix}\nc";
+        let source =
+            "a + b\n\\frac{x\n}{y}\n\\begin{pmatrix}\n1 & 2 \\\\\n3 & 4\n\\end{pmatrix}\nc";
         assert_eq!(
             preview_lines(source),
             vec![
@@ -169,18 +184,4 @@ mod tests {
     fn drops_blank_and_trailing_lines() {
         assert_eq!(preview_lines("x\n\n  y  \n"), vec!["x", "y"]);
     }
-}
-
-fn map_error(error: latex_rust::Error) -> AppError {
-    let code = if matches!(error, latex_rust::Error::Parse(_)) {
-        "E201"
-    } else {
-        "E202"
-    };
-    let message = if code == "E201" {
-        "预览解析失败"
-    } else {
-        "预览布局失败"
-    };
-    AppError::caused(code, message, error)
 }
