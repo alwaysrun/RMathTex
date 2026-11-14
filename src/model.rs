@@ -150,6 +150,10 @@ pub const HINT_COPY_OFFICE: &str =
 /// Toolbar hover text: action name, effect and shortcut of the Markdown copy button.
 pub const HINT_COPY_MARKDOWN: &str =
     "复制为 Markdown（Ctrl+Shift+M）\n按「设置 → Markdown 形态」包装为纯文本";
+/// Exit confirmation text shown while the edited formula has no saved output.
+pub const MSG_EXIT_UNSAVED: &str = "当前公式尚未保存，退出后编辑内容将丢失。";
+/// Hint about where the exit confirmation criterion is configured.
+pub const HINT_EXIT_POLICY: &str = "可在「设置 → 退出提示」中调整判定方式";
 
 // -------------------------------------------------------------------- types
 
@@ -393,6 +397,34 @@ pub enum ThemeChoice {
     Dark,
 }
 
+/// Which output transactions count as "the current formula is saved" when the
+/// user tries to close the window.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ExitSavePolicy {
+    /// Only a successful file export counts; clipboard copies do not.
+    #[default]
+    FileExportOnly,
+    /// Any successful output, including clipboard copies, counts.
+    AnyOutput,
+}
+
+impl ExitSavePolicy {
+    /// Whether closing the app must be confirmed first.
+    ///
+    /// `has_content` is the presence of a non-empty normalized body; the two
+    /// flags track successful outputs performed since the last edit.
+    #[must_use]
+    pub fn requires_confirmation(self, has_content: bool, exported: bool, copied: bool) -> bool {
+        if !has_content {
+            return false;
+        }
+        match self {
+            Self::FileExportOnly => !exported,
+            Self::AnyOutput => !(exported || copied),
+        }
+    }
+}
+
 /// Unified error type shared by the preview, clipboard and export chains.
 #[derive(Debug, thiserror::Error)]
 #[error("{code}: {message}")]
@@ -594,4 +626,28 @@ fn is_single_sided(text: &str) -> bool {
     [("\\(", "\\)"), ("\\[", "\\]")]
         .iter()
         .any(|(open, close)| text.starts_with(open) != text.ends_with(close))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_export_policy_ignores_clipboard_copies() {
+        assert!(ExitSavePolicy::FileExportOnly.requires_confirmation(true, false, true));
+        assert!(!ExitSavePolicy::FileExportOnly.requires_confirmation(true, true, false));
+    }
+
+    #[test]
+    fn any_output_policy_accepts_clipboard_copies() {
+        assert!(!ExitSavePolicy::AnyOutput.requires_confirmation(true, false, true));
+        assert!(ExitSavePolicy::AnyOutput.requires_confirmation(true, false, false));
+    }
+
+    #[test]
+    fn empty_content_never_needs_confirmation() {
+        for policy in [ExitSavePolicy::FileExportOnly, ExitSavePolicy::AnyOutput] {
+            assert!(!policy.requires_confirmation(false, false, false));
+        }
+    }
 }

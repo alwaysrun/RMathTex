@@ -12,14 +12,15 @@ use crate::convert;
 use crate::export;
 use crate::linearmath;
 use crate::model::{
-    self, to_markdown, AppError, CoverageLevel, Delimiter, ExportStyle, ExportTarget, Level,
-    NormalizedSource, Notice, PngBackgroundChoice, RenderKey, Rendered, ThemeChoice,
-    AUTO_FLAVOR_FALLBACK, CONFIG_VERSION, DEBOUNCE_MS, DEFAULT_BACKGROUND, DEFAULT_DPI,
-    DEFAULT_FONT_SIZE_PT, DPI_CHOICES, EDITOR_ROWS, FONT_SIZE_RANGE, HINT_COPY_MARKDOWN,
-    HINT_COPY_OFFICE, MSG_CANCELLED, MSG_CONFIG_SAVED, MSG_COPY_OK, MSG_DOCX_OMML_FAILED,
-    MSG_EMPTY_SOURCE, MSG_EXPORT_OK, MSG_EXTENDED, MSG_IMPORT_OK, MSG_MATHML_UNAVAILABLE,
-    MSG_MD_COPY_OK, MSG_MD_EXPORT_OK, MSG_OMML_UNAVAILABLE, MSG_PLAIN_ONLY, MSG_READY,
-    MSG_UI_FONT_MISSING, MSG_UNSUPPORTED, SOURCE_PANEL_FRACTION, TEXT_EDIT_MARGIN_Y,
+    self, to_markdown, AppError, CoverageLevel, Delimiter, ExitSavePolicy, ExportStyle,
+    ExportTarget, Level, NormalizedSource, Notice, PngBackgroundChoice, RenderKey, Rendered,
+    ThemeChoice, AUTO_FLAVOR_FALLBACK, CONFIG_VERSION, DEBOUNCE_MS, DEFAULT_BACKGROUND,
+    DEFAULT_DPI, DEFAULT_FONT_SIZE_PT, DPI_CHOICES, EDITOR_ROWS, FONT_SIZE_RANGE,
+    HINT_COPY_MARKDOWN, HINT_COPY_OFFICE, HINT_EXIT_POLICY, MSG_CANCELLED, MSG_CONFIG_SAVED,
+    MSG_COPY_OK, MSG_DOCX_OMML_FAILED, MSG_EMPTY_SOURCE, MSG_EXIT_UNSAVED, MSG_EXPORT_OK,
+    MSG_EXTENDED, MSG_IMPORT_OK, MSG_MATHML_UNAVAILABLE, MSG_MD_COPY_OK, MSG_MD_EXPORT_OK,
+    MSG_OMML_UNAVAILABLE, MSG_PLAIN_ONLY, MSG_READY, MSG_UI_FONT_MISSING, MSG_UNSUPPORTED,
+    SOURCE_PANEL_FRACTION, TEXT_EDIT_MARGIN_Y,
 };
 use crate::render::Renderer;
 
@@ -44,6 +45,15 @@ pub struct RMathTexApp {
     config_loaded: bool,
     show_favorites_manager: bool,
     notice: Notice,
+    /// Criterion deciding whether closing the window needs confirmation.
+    exit_policy: ExitSavePolicy,
+    /// Whether the current editor content was exported to a file.
+    exported_since_edit: bool,
+    /// Whether the current editor content was copied to the clipboard.
+    copied_since_edit: bool,
+    show_exit_confirm: bool,
+    /// Set once the prompt was accepted, so the pending close is not cancelled.
+    exit_confirmed: bool,
 }
 
 impl RMathTexApp {
@@ -85,6 +95,11 @@ impl RMathTexApp {
             config_loaded,
             show_favorites_manager: false,
             notice,
+            exit_policy: ExitSavePolicy::default(),
+            exported_since_edit: false,
+            copied_since_edit: false,
+            show_exit_confirm: false,
+            exit_confirmed: false,
         })
     }
 
@@ -131,6 +146,7 @@ impl RMathTexApp {
         self.normalized = model::normalize_source(&self.source);
         self.display_override = None;
         self.last_edit = Some(Instant::now());
+        self.mark_edited();
         self.notice = if let Some(error) = model::validate_source(&self.normalized.body) {
             Notice::error(error.code, error.message)
         } else if let Some(warning) = self.normalized.warning {
@@ -149,6 +165,71 @@ impl RMathTexApp {
 
     fn fail(&mut self, error: AppError) {
         self.notice = Notice::error(error.code, error.message);
+    }
+
+    // ------------------------------------------------------------- exit guard
+
+    /// Forgets the output history, because the editor content just changed and
+    /// the previous copy or export no longer covers it.
+    fn mark_edited(&mut self) {
+        self.exported_since_edit = false;
+        self.copied_since_edit = false;
+    }
+
+    /// Whether closing the window would drop content that counts as unsaved.
+    fn requires_exit_confirmation(&self) -> bool {
+        self.exit_policy.requires_confirmation(
+            !self.normalized.body.is_empty(),
+            self.exported_since_edit,
+            self.copied_since_edit,
+        )
+    }
+
+    /// Handles the menu entry: closes at once, or asks for confirmation first.
+    fn request_exit(&mut self, ctx: &egui::Context) {
+        if self.requires_exit_confirmation() {
+            self.show_exit_confirm = true;
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    /// Converts an OS close request into a confirmation prompt while the edited
+    /// formula has no saved output.
+    fn intercept_close(&mut self, ctx: &egui::Context) {
+        if self.exit_confirmed || !ctx.input(|input| input.viewport().close_requested()) {
+            return;
+        }
+        if self.requires_exit_confirmation() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.show_exit_confirm = true;
+        }
+    }
+
+    fn exit_confirmation(&mut self, ctx: &egui::Context) {
+        if !self.show_exit_confirm {
+            return;
+        }
+        egui::Window::new("退出确认")
+            .order(egui::Order::Foreground)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(MSG_EXIT_UNSAVED);
+                ui.label(RichText::new(HINT_EXIT_POLICY).small().weak());
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("继续编辑").clicked() {
+                        self.show_exit_confirm = false;
+                    }
+                    if ui.button("仍然退出").clicked() {
+                        self.show_exit_confirm = false;
+                        self.exit_confirmed = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+            });
     }
 
     // ------------------------------------------------------------- transactions
@@ -175,6 +256,7 @@ impl RMathTexApp {
             Ok(written) => written,
             Err(error) => return self.fail(error),
         };
+        self.copied_since_edit = true;
         let base = fill(MSG_COPY_OK, &[("formats", &written.join(" + "))]);
         let warning = if coverage.level == CoverageLevel::Extended {
             Some(("E305", MSG_EXTENDED))
@@ -200,6 +282,7 @@ impl RMathTexApp {
                 self.normalized = model::normalize_source(&self.source);
                 self.display_override = None;
                 self.last_edit = Some(Instant::now());
+                self.mark_edited();
                 self.notice = Notice::info(MSG_IMPORT_OK);
             }
             Err(error) => self.fail(error),
@@ -215,6 +298,7 @@ impl RMathTexApp {
         let flavor = self.effective_flavor();
         match clipboard::write_text(&text) {
             Ok(()) => {
+                self.copied_since_edit = true;
                 let notice = fill(MSG_MD_COPY_OK, &[("flavor", flavor.flavor_name())]);
                 self.notice = Notice::info(notice);
             }
@@ -243,6 +327,7 @@ impl RMathTexApp {
         };
         match export::save(target, &bytes) {
             Ok(Some(path)) => {
+                self.exported_since_edit = true;
                 let path = path.display().to_string();
                 self.notice = if target == ExportTarget::Markdown {
                     Notice::info(fill(
@@ -347,7 +432,7 @@ impl RMathTexApp {
                 ui.separator();
                 if ui.button("退出").clicked() {
                     ui.close_menu();
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    self.request_exit(ctx);
                 }
             });
             ui.menu_button("编辑", |ui| {
@@ -478,6 +563,29 @@ impl RMathTexApp {
                 }
             }
             ui.label(RichText::new("行内形态适合单行公式").small().weak());
+        });
+        ui.menu_button("退出提示", |ui| {
+            for (value, label, hint) in [
+                (
+                    ExitSavePolicy::FileExportOnly,
+                    "仅导出文件算已保存",
+                    "默认：复制到剪贴板后退出仍会提示",
+                ),
+                (
+                    ExitSavePolicy::AnyOutput,
+                    "复制或导出都算已保存",
+                    "成功复制或导出后退出不再提示",
+                ),
+            ] {
+                if ui
+                    .radio(self.exit_policy == value, label)
+                    .on_hover_text(hint)
+                    .clicked()
+                {
+                    self.exit_policy = value;
+                    ui.close_menu();
+                }
+            }
         });
     }
 
@@ -810,6 +918,7 @@ impl RMathTexApp {
 impl eframe::App for RMathTexApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.capture_window(ctx);
+        self.intercept_close(ctx);
         self.handle_shortcuts(ctx);
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             self.menu_bar(ctx, ui);
@@ -828,6 +937,7 @@ impl eframe::App for RMathTexApp {
             .show(ctx, |ui| self.editor(ui));
         egui::CentralPanel::default().show(ctx, |ui| self.preview(ctx, ui));
         self.favorites_manager(ctx);
+        self.exit_confirmation(ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
